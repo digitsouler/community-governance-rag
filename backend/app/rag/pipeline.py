@@ -139,7 +139,17 @@ class RAGPipeline:
         ranked, best = self._retrieve(query, trace_id, steps)
         retries = 0
         while best < thr and retries < self.s.max_retrieve_retries:
-            query = self._reformulate(query)
+            new_query = self._reformulate(query)
+            log.info(
+                "[%s] 低于阈值(%.4f<%.4f) 改写查询 | %r -> %r",
+                trace_id, best, thr, query, new_query,
+            )
+            steps.append({
+                "stage": f"reformulate_r{retries + 1}",
+                "detail": f"{query!r} -> {new_query!r}",
+                "ms": None,
+            })
+            query = new_query
             ranked, best = self._retrieve(query, trace_id, steps, retry=retries + 1)
             retries += 1
 
