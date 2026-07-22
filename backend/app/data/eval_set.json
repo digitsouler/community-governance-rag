@@ -1,0 +1,272 @@
+{
+  "meta": {
+    "name": "社区矛盾调解 RAG 评测集",
+    "version": "1.0",
+    "description": "覆盖 retrieve/direct/clarify/out_of_domain 四类路由的评测问答对。expected_route 为期望路由；expected_points 为答案应覆盖的关键要点；expected_category 为期望命中的语料分类（仅 retrieve 类有）；is_out_of_domain 标记是否属离域拒答。",
+    "route_labels": {
+      "retrieve": "走检索并生成",
+      "direct": "直接回答（问候/自我介绍类）",
+      "clarify": "要求澄清（信息过少）",
+      "out_of_domain": "超出服务范围（离域拒答）"
+    }
+  },
+  "cases": [
+    {
+      "id": "eval-noise-1",
+      "query": "楼上每天半夜拖家具、小孩跑来跑去太吵了，我该怎么办",
+      "expected_route": "retrieve",
+      "expected_category": "邻里噪音纠纷",
+      "expected_points": ["核实噪音时段与来源", "保留录音等证据", "依据噪声污染防治法", "协商降噪措施（地垫/限时/软底鞋）"],
+      "is_out_of_domain": false
+    },
+    {
+      "id": "eval-noise-2",
+      "query": "小区广场舞天天晚上外放音响特别吵，物业能管吗",
+      "expected_route": "retrieve",
+      "expected_category": "邻里噪音纠纷",
+      "expected_points": ["公共场所活动噪声管理", "约定音量与结束时间", "场地/设备调整", "多方座谈"],
+      "is_out_of_domain": false
+    },
+    {
+      "id": "eval-water-1",
+      "query": "楼上漏水导致我家天花板发霉了，责任怎么算",
+      "expected_route": "retrieve",
+      "expected_category": "漏水渗水纠纷",
+      "expected_points": ["现场勘验固定证据", "界定责任（防水失效/使用责任）", "民法典相邻关系", "维修与赔偿方案"],
+      "is_out_of_domain": false
+    },
+    {
+      "id": "eval-water-2",
+      "query": "卫生间共用的立管漏水，这个维修费到底谁出",
+      "expected_route": "retrieve",
+      "expected_category": "漏水渗水纠纷",
+      "expected_points": ["区分共有部分与专有部分", "共有部分维修义务", "维修资金或按份分摊", "统一修复"],
+      "is_out_of_domain": false
+    },
+    {
+      "id": "eval-pet-1",
+      "query": "邻居遛狗不牵绳，把老人吓到摔倒了怎么处理",
+      "expected_route": "retrieve",
+      "expected_category": "宠物纠纷",
+      "expected_points": ["核实经过与伤情", "犬主管理责任", "医疗与精神抚慰赔偿", "文明养犬承诺"],
+      "is_out_of_domain": false
+    },
+    {
+      "id": "eval-pet-2",
+      "query": "邻居家狗一到晚上就狂叫，吵得睡不着",
+      "expected_route": "retrieve",
+      "expected_category": "宠物纠纷",
+      "expected_points": ["核实吠叫时段频次", "犬主安抚与管理义务", "夜间安置/行为训练", "文明养犬承诺"],
+      "is_out_of_domain": false
+    },
+    {
+      "id": "eval-parking-1",
+      "query": "有人在小区公共车位私自装地锁长期占着，怎么办",
+      "expected_route": "retrieve",
+      "expected_category": "停车占位纠纷",
+      "expected_points": ["公共区域全体业主共有", "私装地锁违规", "责令拆除恢复", "物业巡查/合规租赁"],
+      "is_out_of_domain": false
+    },
+    {
+      "id": "eval-parking-2",
+      "query": "我租的固定车位被别人一直占着不挪，能怎么维权",
+      "expected_route": "retrieve",
+      "expected_category": "停车占位纠纷",
+      "expected_points": ["核验车位使用权", "返还原物", "责令腾退赔偿", "物业加装标识巡查"],
+      "is_out_of_domain": false
+    },
+    {
+      "id": "eval-fee-1",
+      "query": "物业保洁安保都不到位，我能不能拒交物业费",
+      "expected_route": "retrieve",
+      "expected_category": "物业费纠纷",
+      "expected_points": ["瑕疵不等于根本违约", "不得单方拒交", "物业限期整改", "欠费分期补缴"],
+      "is_out_of_domain": false
+    },
+    {
+      "id": "eval-fee-2",
+      "query": "房子一直空着没人住，物业费还要全交吗",
+      "expected_route": "retrieve",
+      "expected_category": "物业费纠纷",
+      "expected_points": ["物业费对应公共服务", "空置不免交", "规约空置折扣（如有）", "协商补缴"],
+      "is_out_of_domain": false
+    },
+    {
+      "id": "eval-marriage-1",
+      "query": "老人再婚，子女怕财产被分就不来看望也不给赡养费了",
+      "expected_route": "retrieve",
+      "expected_category": "婚姻家庭纠纷",
+      "expected_points": ["老年人权益保障法赡养义务", "恢复探望", "按能力分担赡养", "婚前/婚内财产约定"],
+      "is_out_of_domain": false
+    },
+    {
+      "id": "eval-light-1",
+      "query": "一楼邻居搭了个封闭阳光棚，把我家二楼采光挡住了",
+      "expected_route": "retrieve",
+      "expected_category": "邻里采光通风纠纷",
+      "expected_points": ["调取规划许可/物业备案", "相邻通风采光权", "违建应拆/合规则改建", "签订整改协议"],
+      "is_out_of_domain": false
+    },
+    {
+      "id": "eval-renovation-1",
+      "query": "楼上装修工作日中午和周末全天用电钻，太扰民了",
+      "expected_route": "retrieve",
+      "expected_category": "装修扰民纠纷",
+      "expected_points": ["核对施工时间与规约", "违规时段", "调整时段/降噪措施", "致歉登记与巡检"],
+      "is_out_of_domain": false
+    },
+    {
+      "id": "eval-renovation-2",
+      "query": "邻居装修好像把承重墙给砸了，大家都很担心楼会不会塌",
+      "expected_route": "retrieve",
+      "expected_category": "装修扰民纠纷",
+      "expected_points": ["立即暂停施工核查", "出示设计与审批", "专业机构结构鉴定", "责令恢复加固追责"],
+      "is_out_of_domain": false
+    },
+    {
+      "id": "eval-trash-1",
+      "query": "总有人往楼下扔果皮杂物，楼道还堆满旧家具堵了消防通道",
+      "expected_route": "retrieve",
+      "expected_category": "环境卫生纠纷",
+      "expected_points": ["高空抛物法律责任", "消防通道不得占用", "组织清理恢复", "监控警示与承诺书"],
+      "is_out_of_domain": false
+    },
+    {
+      "id": "eval-trash-2",
+      "query": "有人把电动车推到楼道里私拉电线充电，会不会起火",
+      "expected_route": "retrieve",
+      "expected_category": "环境卫生纠纷",
+      "expected_points": ["高层禁止楼道停放充电", "清理飞线", "迁至集中充电桩", "常态化消防巡查"],
+      "is_out_of_domain": false
+    },
+    {
+      "id": "eval-boundary-1",
+      "query": "顶楼那户把公共屋顶平台上锁自己独占了种菜，我们能管吗",
+      "expected_route": "retrieve",
+      "expected_category": "邻里权属纠纷",
+      "expected_points": ["屋顶平台全体业主共有", "个人不得独占", "拆锁清理恢复共有", "业主共同决定使用"],
+      "is_out_of_domain": false
+    },
+    {
+      "id": "eval-rent-1",
+      "query": "租房到期房东以墙面脏为由不退押金，这合理吗",
+      "expected_route": "retrieve",
+      "expected_category": "租赁纠纷",
+      "expected_points": ["区分正常损耗与人为损坏", "正常磨损不扣费", "核算应退押金", "退租确认清单"],
+      "is_out_of_domain": false
+    },
+    {
+      "id": "eval-rent-2",
+      "query": "合同还没到期房东就要收房还要涨租金，我可以拒绝吗",
+      "expected_route": "retrieve",
+      "expected_category": "租赁纠纷",
+      "expected_points": ["合同期内不得单方变更", "不得强行收房/涨租", "如解约给合理补偿", "补充协议备案"],
+      "is_out_of_domain": false
+    },
+    {
+      "id": "eval-elder-1",
+      "query": "老人生病了，三个子女互相推诿赡养费和陪护怎么办",
+      "expected_route": "retrieve",
+      "expected_category": "养老赡养纠纷",
+      "expected_points": ["赡养义务不可推诿", "按经济能力分摊", "排定轮流陪护", "赡养资金专用账户"],
+      "is_out_of_domain": false
+    },
+    {
+      "id": "eval-business-1",
+      "query": "沿街商铺把货物摆到人行道上，走路都堵得慌",
+      "expected_route": "retrieve",
+      "expected_category": "占道经营纠纷",
+      "expected_points": ["占道经营违规", "规范店内经营/门前三包", "合规外摆许可", "联合城管物业"],
+      "is_out_of_domain": false
+    },
+    {
+      "id": "eval-child-1",
+      "query": "两个小孩在小区游乐设施上争抢，一个把另一个撞骨折了责任咋分",
+      "expected_route": "retrieve",
+      "expected_category": "未成年人纠纷",
+      "expected_points": ["区分监护责任与设施维护责任", "监护人侵权责任", "医疗费分摊", "推动设施检修"],
+      "is_out_of_domain": false
+    },
+    {
+      "id": "eval-green-1",
+      "query": "一楼住户用栅栏把小区公共绿地圈起来种菜了，这算侵占吗",
+      "expected_route": "retrieve",
+      "expected_category": "公共绿地纠纷",
+      "expected_points": ["公共绿地全体业主共有", "个人不得圈占", "恢复绿地拆除围栏", "可规划共享花园"],
+      "is_out_of_domain": false
+    },
+    {
+      "id": "eval-domestic-1",
+      "query": "家里反复发生肢体冲突，我很担心自己的人身安全",
+      "expected_route": "retrieve",
+      "expected_category": "家庭暴力纠纷",
+      "expected_points": ["风险等级评估", "高风险引导报警", "申请人身安全保护令", "联动妇联/派出所/法律援助"],
+      "is_out_of_domain": false
+    },
+    {
+      "id": "eval-direct-1",
+      "query": "你好，你是谁，能帮我做什么",
+      "expected_route": "direct",
+      "expected_category": null,
+      "expected_points": ["社区矛盾调解助理", "邻里/物业/赡养等场景", "说明使用方式"],
+      "is_out_of_domain": false
+    },
+    {
+      "id": "eval-direct-2",
+      "query": "在吗",
+      "expected_route": "direct",
+      "expected_category": null,
+      "expected_points": ["自我介绍/引导描述问题"],
+      "is_out_of_domain": false
+    },
+    {
+      "id": "eval-clarify-1",
+      "query": "调解",
+      "expected_route": "clarify",
+      "expected_category": null,
+      "expected_points": ["信息过少", "请补充矛盾类型与关键事实"],
+      "is_out_of_domain": false
+    },
+    {
+      "id": "eval-clarify-2",
+      "query": "有矛盾",
+      "expected_route": "clarify",
+      "expected_category": null,
+      "expected_points": ["信息过少", "请补充矛盾类型与关键事实"],
+      "is_out_of_domain": false
+    },
+    {
+      "id": "eval-ood-1",
+      "query": "附近有什么好唱歌的KTV推荐一下",
+      "expected_route": "out_of_domain",
+      "expected_category": null,
+      "expected_points": ["超出服务范围", "说明只处理社区治理场景"],
+      "is_out_of_domain": true
+    },
+    {
+      "id": "eval-ood-2",
+      "query": "帮我查下明天天气怎么样，适不适合去爬山",
+      "expected_route": "out_of_domain",
+      "expected_category": null,
+      "expected_points": ["超出服务范围", "说明只处理社区治理场景"],
+      "is_out_of_domain": true
+    },
+    {
+      "id": "eval-ood-3",
+      "query": "推荐几只最近能涨的股票基金呗",
+      "expected_route": "out_of_domain",
+      "expected_category": null,
+      "expected_points": ["超出服务范围", "说明只处理社区治理场景"],
+      "is_out_of_domain": true
+    },
+    {
+      "id": "eval-boundary-ood-1",
+      "query": "楼下KTV唱歌太吵了到半夜，严重扰民怎么办",
+      "expected_route": "retrieve",
+      "expected_category": "邻里噪音纠纷",
+      "expected_points": ["噪音扰民属治理范围", "核实时段来源", "依据噪声污染防治法", "协商/投诉处置"],
+      "is_out_of_domain": false,
+      "note": "边界样例：含离域词 KTV 但同时命中治理词『扰民/吵』，应判 retrieve 而非 out_of_domain"
+    }
+  ]
+}
