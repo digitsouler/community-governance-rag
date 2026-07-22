@@ -46,7 +46,7 @@ async function send(text) {
     last.loading = false
     last.content = data.answer || ''
     last.route = data.route
-    last.sources = data.sources || []
+    last.sources = (data.sources || []).filter(s => s.score >= SOURCE_MIN_SCORE)
     last.retries = data.self_rag_retries
     last.model = data.model
     last.latency = data.latency_ms
@@ -67,7 +67,10 @@ function scrollToBottom() {
   if (chatArea.value) chatArea.value.scrollTop = chatArea.value.scrollHeight
 }
 
-const routeLabel = { retrieve: '检索回答', direct: '直接回答', clarify: '需澄清' }
+const routeLabel = { retrieve: '检索回答', direct: '直接回答', clarify: '需澄清', out_of_domain: '超出范围' }
+
+// 与后端 source_display_min_score 对齐：低于此相关度的命中视为噪音，不渲染来源卡片
+const SOURCE_MIN_SCORE = 0.3
 </script>
 
 <template>

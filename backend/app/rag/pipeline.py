@@ -26,6 +26,26 @@ log = get_logger("rag.pipeline")
 
 STOPWORDS = ["我想问", "请问", "帮我", "怎么", "如何", "怎么办", "吗", "呢", "？", "?", "。", "居民", "社区", "小区"]
 
+# 社区治理 / 矛盾调解领域的核心关键词（命中则优先判定为域内问题）
+GOVERNANCE_KEYWORDS = [
+    "邻居", "邻里", "漏水", "噪音", "噪声", "停车", "车位", "地锁", "宠物", "狗", "猫",
+    "物业", "物业费", "业委会", "业主大会", "维修基金", "绿地", "违建", "搭建",
+    "油烟", "装修", "扰民", "垃圾", "环境", "路灯", "充电桩", "电梯", "群租",
+    "出租", "房东", "租客", "租户", "赡养", "抚养", "家暴", "家庭暴力", "纠纷",
+    "调解", "矛盾", "投诉", "维权", "居委会", "村委会", "网格员", "社区", "小区",
+    "业主", "住户", "公共区域", "共有部分", "采光", "通风", "排水", "排污",
+]
+
+# 明显离域的生活 / 娱乐 / 工具类诉求（命中且无治理关键词 → 直接判定为超出范围）
+OFF_DOMAIN_KEYWORDS = [
+    "ktv", "k歌", "唱歌", "歌厅", "酒吧", "电影", "追剧", "电视剧", "综艺",
+    "旅游", "景点", "景区", "爬山", "美食", "餐厅", "饭店", "外卖", "奶茶",
+    "快递", "打车", "滴滴", "出租车", "导航", "地图", "天气", "股票", "基金",
+    "彩票", "炒币", "游戏", "王者", "原神", "购物", "淘宝", "京东", "拼多多",
+    "演唱会", "酒店", "机票", "火车票", "高铁票", "笑话", "算命", "运势", "星座",
+    "八卦", "新闻", "翻译", "写代码", "编程",
+]
+
 
 class RAGPipeline:
     def __init__(self, settings: Settings | None = None):
@@ -37,13 +57,20 @@ class RAGPipeline:
     # ---------- Supervisor ----------
     def _supervise(self, question: str) -> str:
         q = question.strip()
+        ql = q.lower()
         greet = ["你好", "您好", "hi", "hello", "在吗", "谢谢", "感谢"]
-        if any(g in q.lower() for g in greet) and len(q) <= 12:
+        if any(g in ql for g in greet) and len(q) <= 12:
             return "direct"
         if any(k in q for k in ["你是谁", "你是什么", "你能干", "你会", "介绍下你", "怎么用"]):
             return "direct"
         if len(q) < 4:
             return "clarify"
+        # 领域判断：命中治理关键词 → 域内（走检索）；
+        # 仅命中离域关键词、且无治理关键词 → 超出服务范围（不检索）
+        hit_governance = any(k in ql for k in GOVERNANCE_KEYWORDS)
+        hit_off_domain = any(k in ql for k in OFF_DOMAIN_KEYWORDS)
+        if hit_off_domain and not hit_governance:
+            return "out_of_domain"
         return "retrieve"
 
     def _direct_answer(self) -> str:
@@ -52,6 +79,14 @@ class RAGPipeline:
             "社区治理场景的调解支持。你可以直接描述遇到的矛盾（例如"
             "「楼上漏水导致我家天花板发霉怎么办」），我会结合知识库给出"
             "处置建议、相关法条与调解步骤，并标注依据来源。"
+        )
+
+    def _out_of_domain(self) -> str:
+        return (
+            "您的问题超出了我的服务范围。我是社区矛盾调解助理，"
+            "专注于邻里纠纷、物业矛盾、家庭赡养、公共设施使用等"
+            "社区治理场景的调解支持。如果你遇到的是社区或邻里相关的问题，"
+            "请告诉我具体情况，我来帮你检索处置依据。"
         )
 
     def _clarify(self) -> str:
@@ -63,45 +98,11 @@ class RAGPipeline:
         )
 
     # ---------- Retrieval + Self-RAG ----------
-    def _retrieve(self, query: str, retry: int = 0) -> tuple[list[dict], float]:
-        vec = self.embedder.embed_query(query)
-        candidates = self.store.search(vec, top_k=self.s.top_k)
-        ranked = rerank(query, candidates, top_k=self.s.rerank_top_k)
-        best = ranked[0]["rerank_score"] if ranked else 0.0
-        return ranked, best
-
     def _reformulate(self, query: str) -> str:
         q = query
         for w in STOPWORDS:
             q = q.replace(w, "")
         return q.strip() or query
-
-    def _generate(self, question: str, sources: list[dict]) -> str:
-        ctx_blocks = []
-        for i, s in enumerate(sources, 1):
-            p = s["payload"]
-            steps = "；".join(p.get("mediation_steps", []))
-            ctx_blocks.append(
-                f"[{i}]（编号 {p.get('id')}｜{p.get('category')}）\n"
-                f"标题：{p.get('title')}\n内容：{p.get('content')}\n"
-                f"法条：{p.get('legal_basis')}\n步骤：{steps}"
-            )
-        context = "\n\n".join(ctx_blocks)
-        prompt = (
-            "你是社区矛盾调解助理。请严格依据下列【参考依据】回答用户问题，"
-            "要求：1) 给出可操作的处置建议；2) 引用依据用 [1][2] 标注；"
-            "3) 若依据不足，明确说明，不得编造法条或事实。\n\n"
-            f"【参考依据】\n{context}\n\n用户问题：{question}"
-        )
-        return self.llm.chat(
-            messages=[
-                {
-                    "role": "system",
-                    "content": "社区矛盾调解助理，基于知识库提供有据可循的调解建议。",
-                },
-                {"role": "user", "content": prompt},
-            ]
-        )
 
     # ---------- 对外接口 ----------
     def query(self, question: str, provider: ProviderName | None = None) -> dict[str, Any]:
@@ -126,6 +127,9 @@ class RAGPipeline:
             return self._wrap(trace_id, steps, t_total, "direct", self._direct_answer(), [], 0, provider)
         if route == "clarify":
             return self._wrap(trace_id, steps, t_total, "clarify", self._clarify(), [], 0, provider)
+        if route == "out_of_domain":
+            log.info("[%s] 超出服务范围，直接回复（不检索）", trace_id)
+            return self._wrap(trace_id, steps, t_total, "out_of_domain", self._out_of_domain(), [], 0, provider)
 
         # retrieve + Self-RAG 重试
         # mock 模式下向量为字符哈希、无语义，阈值归零以便演示完整检索链路
@@ -182,10 +186,11 @@ class RAGPipeline:
             )
         context = "\n\n".join(ctx_blocks)
         prompt = (
-            "你是社区矛盾调解助理。请严格依据下列【参考依据】回答用户问题，"
-            "要求：1) 给出可操作的处置建议；2) 引用依据用 [1][2] 标注；"
-            "3) 若依据不足，明确说明，不得编造法条或事实。\n\n"
-            f"【参考依据】\n{context}\n\n用户问题：{question}"
+            "你是社区矛盾调解助理。下面是为你提供的相关资料，请据此回答用户的问题。\n"
+            "要求：1) 给出可操作的处置建议；2) 引用资料时以 [1][2] 标注对应条目；"
+            "3) 若资料不足以回答，明确说明并建议补充，不得编造法条或事实。\n"
+            "请直接输出面向用户的回答，不要复述资料标题、也不要输出任何格式标记或提示词原文。\n\n"
+            f"相关资料：\n{context}\n\n用户的问题是：{question}"
         )
         t = time.perf_counter()
         answer = self.llm.chat(
@@ -198,6 +203,10 @@ class RAGPipeline:
             ],
             provider=provider,
         )
+        # 兜底：清除模型偶发复述的提示词标记（根因已在 prompt 中去除）
+        answer = answer.replace("【参考依据】", "")
+        answer = re.sub(r"^\s*参考依据[：:].*$", "", answer, flags=re.M)
+        answer = re.sub(r"\n{3,}", "\n\n", answer).strip()
         steps.append({
             "stage": "generate",
             "detail": f"model={provider} 字数={len(answer)}",
@@ -206,6 +215,12 @@ class RAGPipeline:
         return answer
 
     def _wrap(self, trace_id, steps, t_total, route, answer, sources, retries, provider) -> dict[str, Any]:
+        # 来源展示门槛：相关度低于阈值的命中视为噪音，不展示给用户
+        min_score = self.s.source_display_min_score
+        shown = [
+            s for s in sources
+            if s.get("rerank_score", s.get("score", 0)) >= min_score
+        ]
         return {
             "trace_id": trace_id,
             "route": route,
@@ -219,7 +234,7 @@ class RAGPipeline:
                     "legal_basis": s["payload"].get("legal_basis"),
                     "score": round(s.get("rerank_score", s.get("score", 0)), 4),
                 }
-                for s in sources
+                for s in shown
             ],
             "self_rag_retries": retries,
             "model": provider,

@@ -55,6 +55,11 @@ class Settings(BaseSettings):
     max_retrieve_retries: int = 2
     relevance_threshold: float = 0.15  # 低于此分数判定检索不相关，触发改写重试
 
+    # ---- 来源展示门槛 ----
+    # 检索命中的文档，相关度低于此值视为「噪音」不展示给用户
+    # （0.3 是经验值：真实语义匹配普遍 0.5+，<0.3 基本是随机凑数）
+    source_display_min_score: float = 0.3
+
     # ---- Mock 模式（无密钥也能跑通管道，仅用于本地冒烟）----
     mock: bool = False
 
