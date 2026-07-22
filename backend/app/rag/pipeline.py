@@ -16,8 +16,10 @@ import uuid
 from typing import Any
 
 from app.config import ProviderName, Settings, get_settings
+from app.data.ingest import load_documents
 from app.log import get_logger
 from app.rag.embeddings import EmbeddingClient
+from app.rag.hybrid import BM25Index, rrf_fuse
 from app.rag.llm import LLMClient
 from app.rag.rerank import rerank
 from app.rag.vectorstore import get_vector_store
@@ -53,6 +55,15 @@ class RAGPipeline:
         self.embedder = EmbeddingClient(self.s)
         self.store = get_vector_store(self.s)
         self.llm = LLMClient(self.s)
+        # 稀疏召回索引（BM25）：与向量库同源语料，懒构建一次
+        self.bm25 = BM25Index()
+        try:
+            docs = load_documents()
+            self.bm25.build([{"id": d["id"], "payload": d} for d in docs])
+            log.info("BM25 稀疏索引构建完成 | 文档数=%d", self.bm25._n)
+        except Exception as e:
+            log.warning("BM25 索引构建失败，混合检索降级为纯向量：%s", e)
+            self.bm25._built = False
 
     # ---------- Supervisor ----------
     def _supervise(self, question: str) -> str:
@@ -168,18 +179,35 @@ class RAGPipeline:
     def _retrieve(self, query: str, trace_id: str, steps: list, retry: int = 0) -> tuple[list[dict], float]:
         t = time.perf_counter()
         vec = self.embedder.embed_query(query)
-        t_emb = time.perf_counter()
-        candidates = self.store.search(vec, top_k=self.s.top_k)
+        dense = self.store.search(vec, top_k=self.s.top_k)
+
+        # 混合检索：稠密 ∪ 稀疏(BM25) → RRF 融合扩大候选池 → rerank 精排
+        if self.s.enable_hybrid and self.bm25.is_built:
+            sparse = self.bm25.search(query, top_k=self.s.top_k)
+            fused = rrf_fuse([dense, sparse], k=self.s.rrf_k)
+            # 把 dense 余弦分回填到融合候选，供 rerank 的 hybrid_score 使用
+            dense_scores = {d["id"]: d["score"] for d in dense}
+            for f in fused:
+                f["score"] = dense_scores.get(f["id"], 0.0)
+            candidates = fused
+            mode = "hybrid"
+        else:
+            candidates = dense
+            mode = "vector"
+
         ranked = rerank(query, candidates, top_k=self.s.rerank_top_k)
         best = ranked[0]["rerank_score"] if ranked else 0.0
         label = f"retry={retry} " if retry else ""
-        log.info("[%s] 检索%s| 候选=%d 命中top=%d 最佳分=%.4f", trace_id, label, len(candidates), len(ranked), best)
+        log.info(
+            "[%s] 检索%s[%s] | 候选=%d 命中top=%d 最佳分=%.4f",
+            trace_id, label, mode, len(candidates), len(ranked), best,
+        )
         mark = "retrieve"
         if retry:
             mark = f"retrieve_r{retry}"
         steps.append({
             "stage": mark,
-            "detail": f"候选={len(candidates)} top={len(ranked)} best={best:.4f}",
+            "detail": f"mode={mode} 候选={len(candidates)} top={len(ranked)} best={best:.4f}",
             "ms": round((time.perf_counter() - t) * 1000, 1),
         })
         return ranked, best

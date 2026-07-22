@@ -55,6 +55,12 @@ class Settings(BaseSettings):
     max_retrieve_retries: int = 2
     relevance_threshold: float = 0.15  # 低于此分数判定检索不相关，触发改写重试
 
+    # ---- 混合检索（Hybrid Retrieval）----
+    # 稠密向量召回 ∪ BM25 稀疏召回，经 RRF 融合后送 rerank 精排。
+    # 关闭则退化为纯向量召回（与旧版一致）；开启可补专有词/法条条号召回。
+    enable_hybrid: bool = True
+    rrf_k: int = 60  # RRF 融合常数
+
     # ---- 来源展示门槛 ----
     # 检索命中的文档，相关度低于此值视为「噪音」不展示给用户
     # （0.3 是经验值：真实语义匹配普遍 0.5+，<0.3 基本是随机凑数）
