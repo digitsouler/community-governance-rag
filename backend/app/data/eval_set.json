@@ -267,6 +267,51 @@
       "expected_points": ["噪音扰民属治理范围", "核实时段来源", "依据噪声污染防治法", "协商/投诉处置"],
       "is_out_of_domain": false,
       "note": "边界样例：含离域词 KTV 但同时命中治理词『扰民/吵』，应判 retrieve 而非 out_of_domain"
+    },
+    {
+      "id": "eval-adv-1",
+      "query": "第二百九十三条",
+      "expected_route": "retrieve",
+      "expected_category": "邻里采光通风纠纷",
+      "expected_points": ["民法典第二百九十三条 相邻通风采光权", "日照间距标准", "违建应拆/改建"],
+      "is_out_of_domain": false,
+      "note": "对抗评测：纯法条条号无场景描述，稠密向量排偏至停车占位，混合检索靠 BM25 字面精确匹配纠正"
+    },
+    {
+      "id": "eval-adv-2",
+      "query": "第一千二百四十五条",
+      "expected_route": "retrieve",
+      "expected_category": "宠物纠纷",
+      "expected_points": ["民法典第一千二百四十五条 饲养动物损害责任", "犬主管理义务", "医疗与赔偿"],
+      "is_out_of_domain": false,
+      "note": "对抗评测：纯法条条号，稠密向量排偏至婚姻家庭，混合检索纠正至宠物纠纷"
+    },
+    {
+      "id": "eval-adv-3",
+      "query": "第二百九十六条",
+      "expected_route": "retrieve",
+      "expected_category": "漏水渗水纠纷",
+      "expected_points": ["民法典第二百九十六条 相邻关系", "排水利用避免损害", "维修与赔偿"],
+      "is_out_of_domain": false,
+      "note": "对抗评测：纯法条条号，验证混合检索对字面精确匹配的召回能力"
+    },
+    {
+      "id": "eval-adv-4",
+      "query": "第五十条",
+      "expected_route": "retrieve",
+      "expected_category": "停车占位纠纷",
+      "expected_points": ["物业管理条例第五十条 公共设施不得改变用途", "私装地锁违规", "责令拆除恢复"],
+      "is_out_of_domain": false,
+      "note": "对抗评测：条号在多篇文档出现（停车/权属/绿地），测试混合检索的消歧能力"
+    },
+    {
+      "id": "eval-adv-5",
+      "query": "第二十八条",
+      "expected_route": "retrieve",
+      "expected_category": "环境卫生纠纷",
+      "expected_points": ["第二十八条 高空抛物法律责任", "消防通道不得占用", "清理恢复"],
+      "is_out_of_domain": false,
+      "note": "对抗评测：条号在多类文档出现，测试混合检索消歧"
     }
   ]
 }

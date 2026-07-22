@@ -185,10 +185,13 @@ class RAGPipeline:
         if self.s.enable_hybrid and self.bm25.is_built:
             sparse = self.bm25.search(query, top_k=self.s.top_k)
             fused = rrf_fuse([dense, sparse], k=self.s.rrf_k)
-            # 把 dense 余弦分回填到融合候选，供 rerank 的 hybrid_score 使用
+            # 把 dense 余弦分回填到融合候选，供 rerank 的 hybrid_score 使用。
+            # 对 BM25 独有命中（向量未召回）的文档，用 dense 最低分作为估计值，
+            # 避免 score=0 被 rerank 的 0.7×向量权重直接压死，保证 RRF 纠错不被抹平。
             dense_scores = {d["id"]: d["score"] for d in dense}
+            min_dense = min((d["score"] for d in dense), default=0.0)
             for f in fused:
-                f["score"] = dense_scores.get(f["id"], 0.0)
+                f["score"] = dense_scores.get(f["id"], min_dense)
             candidates = fused
             mode = "hybrid"
         else:
