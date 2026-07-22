@@ -1,0 +1,40 @@
+# ============ 本地密钥与运行环境（切勿提交）============
+.env
+.env.*
+!.env.example
+.venv/
+venv/
+env/
+
+# ============ Python ============
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.pytest_cache/
+.mypy_cache/
+
+# ============ 运行日志与本地数据 ============
+backend/logs/
+*.log
+
+# ============ Node / 前端 ============
+node_modules/
+dist/
+frontend/node_modules/
+frontend/dist/
+
+# ============ 工具本地状态 ============
+# WorkBuddy 项目记忆，含本地绝对路径，属本地状态，勿提交
+.workbuddy/
+
+# ============ IDE / 编辑器 ============
+.idea/
+.vscode/
+
+# ============ 系统 ============
+.DS_Store
+Thumbs.db
+
+# ============ 内部规划文档（偏内部复盘语气，不对外开源）============
+RAG-PROJECT-PLAN.md

@@ -1,0 +1,14 @@
+# 生产完整依赖（在你自己的机器上 pip install -r requirements.txt）
+fastapi
+uvicorn[standard]
+qdrant-client
+openai
+pydantic
+pydantic-settings
+python-dotenv
+httpx
+numpy
+
+# 说明：当前仓库「零依赖」即可运行（仅用标准库 + httpx）。
+# 若环境没有 httpx：pip install httpx
+# 若想用 Qdrant / FastAPI 生产栈：取消注释上方对应包，并按 README 切换入口。
