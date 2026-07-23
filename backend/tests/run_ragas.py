@@ -10,12 +10,15 @@ RAGAS 评分需要 LLM + Embedding。默认示例用 OpenAI，但本项目面向
 
 方案 A · 用 DeepSeek 当评分 LLM + 智谱 embedding-3 当评分 Embedding：
   from langchain_openai import ChatOpenAI, OpenAIEmbeddings
-  llm = ChatOpenAI(model="deepseek-chat",
+  from ragas.llms import LangchainLLMWrapper
+  from ragas.embeddings import LangchainEmbeddingsWrapper
+  # 注意：ragas 0.2.x 要求把原生 langchain 模型用官方包装类包一层（提供 set_run_config）
+  llm = LangchainLLMWrapper(ChatOpenAI(model="deepseek-chat",
                    api_key=os.getenv("DEEPSEEK_API_KEY"),
-                   base_url="https://api.deepseek.com/v1", temperature=0)
-  emb = OpenAIEmbeddings(model="embedding-3",
+                   base_url="https://api.deepseek.com/v1", temperature=0))
+  emb = LangchainEmbeddingsWrapper(OpenAIEmbeddings(model="embedding-3",
                          api_key=os.getenv("ZHIPU_API_KEY"),
-                         base_url="https://open.bigmodel.cn/api/paas/v4")
+                         base_url="https://open.bigmodel.cn/api/paas/v4"))
 
 方案 B · 直接用 OpenAI（若你有 key）：
   llm = ChatOpenAI(model="gpt-4o-mini", temperature=0)
@@ -100,9 +103,23 @@ def main() -> None:
     args = ap.parse_args()
     provs = PROVIDERS if args.provider == "all" else [args.provider]
 
-    _load_dotenv(BASE / ".env") 
+    _load_dotenv(BASE / ".env")
 
     # 延迟导入，确保本机装了 ragas 才 import
+    # —— 兼容补丁 ——
+    # ragas 0.2.x 在 import 阶段硬性 import langchain_community.chat_models.vertexai，
+    # 但新版 langchain_community(>=0.3) 已移除该路径，会触发 ModuleNotFoundError。
+    # 本项目只用 DeepSeek/智谱，从不使用 VertexAI，故注入一个占位子模块让 import 通过。
+    try:
+        import langchain_community.chat_models.vertexai  # noqa: F401
+    except ModuleNotFoundError:
+        import sys
+        import types
+        _vmod = types.ModuleType("langchain_community.chat_models.vertexai")
+        class ChatVertexAI:  # 占位类，ragas 仅做 import，本项目不会实例化它
+            pass
+        _vmod.ChatVertexAI = ChatVertexAI
+        sys.modules["langchain_community.chat_models.vertexai"] = _vmod
     from ragas import evaluate
     from ragas.metrics import (
         faithfulness,
@@ -112,21 +129,23 @@ def main() -> None:
     )
     import os
     from langchain_openai import ChatOpenAI, OpenAIEmbeddings
-    from datasets import Dataset 
+    from datasets import Dataset
+    from ragas.llms import LangchainLLMWrapper
+    from ragas.embeddings import LangchainEmbeddingsWrapper 
 
     # 默认用 DeepSeek 当评分 LLM + 智谱 embedding-3 当评分 Embedding（国内模型可直接跑）
     # 若用 OpenAI，改回下方注释的两行：
-    llm = ChatOpenAI(
+    llm = LangchainLLMWrapper(ChatOpenAI(
         model="deepseek-chat",
         api_key=os.getenv("DEEPSEEK_API_KEY"),
         base_url="https://api.deepseek.com/v1",
         temperature=0,
-    )
-    emb = OpenAIEmbeddings(
+    ))
+    emb = LangchainEmbeddingsWrapper(OpenAIEmbeddings(
         model="embedding-3",
         api_key=os.getenv("ZHIPU_API_KEY"),
         base_url="https://open.bigmodel.cn/api/paas/v4",
-    )
+    ))
     # llm = ChatOpenAI(model="gpt-4o-mini", temperature=0)
     # emb = OpenAIEmbeddings(model="text-embedding-3-small")
 
@@ -154,8 +173,6 @@ def main() -> None:
         result = evaluate(
             Dataset.from_list(data),
             metrics=[faithfulness, answer_relevancy, context_precision, context_recall],
-            llm=llm,
-            embeddings=emb,
         )
         df = result.to_pandas()
         means = {m: df[m].mean() for m in ["faithfulness", "answer_relevancy", "context_precision", "context_recall"]}
