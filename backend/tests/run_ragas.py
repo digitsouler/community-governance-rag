@@ -1,4 +1,4 @@
-"""RAGAS 评测打分脚本（在你本机运行，沙箱 PyPI 被墙无法安装 ragas）。
+"""4.RAGAS 评测打分脚本（在本机运行）。
 
 前置（本机一次性）：
   # 锁定 0.2.x：0.1.x import 阶段会因 langchain_community 新版路径崩溃；0.3.x 又改了 API
@@ -59,11 +59,6 @@ def load_answers(path: Path) -> list[dict]:
 
 
 def _load_dotenv(path: Path) -> None:
-    """极简 .env 加载（纯标准库，避免额外依赖）。
-
-    把 backend/.env 的 KEY=VALUE 写入 os.environ（已存在的环境变量不覆盖），
-    这样下方 os.getenv 取 key 时无需用户手动 export。
-    """
     if not path.exists():
         print(f"[.env] 未找到 {path}，将直接使用系统环境变量")
         return
@@ -105,7 +100,7 @@ def main() -> None:
     args = ap.parse_args()
     provs = PROVIDERS if args.provider == "all" else [args.provider]
 
-    _load_dotenv(BASE / ".env")  # 自动读 backend/.env，无需手动 export key
+    _load_dotenv(BASE / ".env") 
 
     # 延迟导入，确保本机装了 ragas 才 import
     from ragas import evaluate
@@ -115,8 +110,9 @@ def main() -> None:
         context_precision,
         context_recall,
     )
+    import os
     from langchain_openai import ChatOpenAI, OpenAIEmbeddings
-    from datasets import Dataset  # ragas 的依赖，随 ragas 自动安装
+    from datasets import Dataset 
 
     # 默认用 DeepSeek 当评分 LLM + 智谱 embedding-3 当评分 Embedding（国内模型可直接跑）
     # 若用 OpenAI，改回下方注释的两行：
@@ -158,6 +154,8 @@ def main() -> None:
         result = evaluate(
             Dataset.from_list(data),
             metrics=[faithfulness, answer_relevancy, context_precision, context_recall],
+            llm=llm,
+            embeddings=emb,
         )
         df = result.to_pandas()
         means = {m: df[m].mean() for m in ["faithfulness", "answer_relevancy", "context_precision", "context_recall"]}
