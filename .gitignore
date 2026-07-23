@@ -18,6 +18,9 @@ __pycache__/
 backend/logs/
 *.log
 
+# ============ 评测生成产物（由 gen_answers.py 生成，含调用记录，勿提交）============
+backend/eval_results/
+
 # ============ Node / 前端 ============
 node_modules/
 dist/
