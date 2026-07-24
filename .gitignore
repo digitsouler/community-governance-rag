@@ -21,6 +21,13 @@ backend/logs/
 # ============ 评测生成产物（由 gen_answers.py 生成，含调用记录，勿提交）============
 backend/eval_results/
 
+# ============ 入库管道生成的索引（由 ingest 生成，可重跑复现，勿提交）============
+backend/data/ingested.jsonl
+# 知识库 manifest（首次启动由 KBManager.ensure 从种子+corpus/raw 重建，勿提交）
+backend/data/kb_manifest.jsonl
+# 用户上传文档落盘目录（运行时产生，勿提交）
+backend/corpus/uploads/
+
 # ============ Node / 前端 ============
 node_modules/
 dist/

@@ -72,8 +72,8 @@ def source_accuracy(answer: str, contexts: list[dict], expected_cat: str | None)
     return None
 
 
-def eval_provider(prov: str) -> dict:
-    path = OUT_DIR / f"answers_{prov}.jsonl"
+def eval_provider(prov: str, tag: str = "") -> dict:
+    path = OUT_DIR / (f"answers_{tag}_{prov}.jsonl" if tag else f"answers_{prov}.jsonl")
     if not path.exists():
         return {"error": f"缺少 {path.name}，请先跑 gen_answers.py"}
     rows = load_answers(path)
@@ -110,13 +110,15 @@ def eval_provider(prov: str) -> dict:
 def main() -> None:
     ap = argparse.ArgumentParser()
     ap.add_argument("--provider", default="all", choices=PROVIDERS + ["all"])
+    ap.add_argument("--tag", default="", help="答案文件标签，如 v1；加载 answers_{tag}_{provider}.jsonl")
     args = ap.parse_args()
     provs = PROVIDERS if args.provider == "all" else [args.provider]
+    tag = args.tag.strip()
 
     print(f"{'模型':<10}{'n':>4}{'要点覆盖':>10}{'来源准确':>10}{'拒答OK':>9}{'平均延迟ms':>12}")
     print("-" * 58)
     for p in provs:
-        r = eval_provider(p)
+        r = eval_provider(p, tag)
         if "error" in r:
             print(f"{p:<10}  {r['error']}")
             continue

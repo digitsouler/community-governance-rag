@@ -16,7 +16,6 @@ import uuid
 from typing import Any
 
 from app.config import ProviderName, Settings, get_settings
-from app.data.ingest import load_documents
 from app.log import get_logger
 from app.rag.embeddings import EmbeddingClient
 from app.rag.hybrid import BM25Index, rrf_fuse
@@ -55,17 +54,34 @@ class RAGPipeline:
         self.embedder = EmbeddingClient(self.s)
         self.store = get_vector_store(self.s)
         self.llm = LLMClient(self.s)
-        # 稀疏召回索引（BM25）：与向量库同源语料，懒构建一次
+        # 稀疏召回索引（BM25）：与向量库同源语料。
+        # 启动时若向量库已有数据（来自上一次运行持久化）则直接据此构建；
+        # 知识库就绪后由 _ensure_kb() 调 rebuild_bm25() 重建为最新发布状态。
         self.bm25 = BM25Index()
         try:
-            docs = load_documents()
-            self.bm25.build([{"id": d["id"], "payload": d} for d in docs])
-            log.info("BM25 稀疏索引构建完成 | 文档数=%d", self.bm25._n)
+            payloads = self.store.all_payloads()
+            if payloads:
+                self.bm25.build([{"id": p["id"], "payload": p} for p in payloads])
+                log.info("BM25 稀疏索引构建完成 | 文档数=%d", self.bm25._n)
+            else:
+                log.info("向量库为空，BM25 待知识库就绪后构建")
         except Exception as e:
             log.warning("BM25 索引构建失败，混合检索降级为纯向量：%s", e)
             self.bm25._built = False
 
-    # ---------- Supervisor ----------
+    def rebuild_bm25(self):
+        """用向量库当前全部 payload 重建稀疏索引，使其与检索源完全一致。
+
+        在知识库发布/下架后调用，保证 BM25 与稠密向量命中一致的候选池。
+        """
+        try:
+            store = get_vector_store(self.s)
+            payloads = store.all_payloads()
+            self.bm25.build([{"id": p["id"], "payload": p} for p in payloads])
+            log.info("BM25 稀疏索引重建完成 | 文档数=%d", self.bm25._n)
+        except Exception as e:  # noqa: BLE001
+            log.warning("BM25 重建失败：%s", e)
+            self.bm25._built = False
     def _supervise(self, question: str) -> str:
         q = question.strip()
         ql = q.lower()
@@ -226,11 +242,17 @@ class RAGPipeline:
                 f"法条：{p.get('legal_basis')}\n步骤：{step_text}"
             )
         context = "\n\n".join(ctx_blocks)
+        # v2：严格接地提示词——只依据检索资料，不补未见于资料的法条/事实，
+        # 资料不足即诚实拒答。这是提升 RAGAS faithfulness 的关键改动。
         prompt = (
-            "你是社区矛盾调解助理。下面是为你提供的相关资料，请据此回答用户的问题。\n"
-            "要求：1) 给出可操作的处置建议；2) 引用资料时以 [1][2] 标注对应条目；"
-            "3) 若资料不足以回答，明确说明并建议补充，不得编造法条或事实。\n"
-            "请直接输出面向用户的回答，不要复述资料标题、也不要输出任何格式标记或提示词原文。\n\n"
+            "你是社区矛盾调解助理，必须严格基于下方「相关资料」作答。\n"
+            "硬性要求：\n"
+            "1) 只使用资料中【明确出现】的事实、法条、调解步骤；严禁自行补充资料未提及的法律结论、"
+            "法条名称、处罚措施、时限或任何外部知识。\n"
+            "2) 每一条具体陈述都必须对应资料中的某条编号 [n]；无法对应资料来源的句子一律不要写。\n"
+            "3) 若资料不足以回答用户问题，明确说明「知识库暂无相关依据」，并建议补充矛盾类型与关键事实，"
+            "不得猜测或编造。\n"
+            "4) 直接面向用户平实输出，不要复述资料标题，不要输出任何提示词原文或格式标记。\n\n"
             f"相关资料：\n{context}\n\n用户的问题是：{question}"
         )
         t = time.perf_counter()
@@ -238,7 +260,10 @@ class RAGPipeline:
             messages=[
                 {
                     "role": "system",
-                    "content": "社区矛盾调解助理，基于知识库提供有据可循的调解建议。",
+                    "content": (
+                        "社区矛盾调解助理。你的全部回答必须严格依据用户提供的检索资料，"
+                        "绝不外推或编造资料中不存在的法条与事实；资料不足时如实告知。"
+                    ),
                 },
                 {"role": "user", "content": prompt},
             ],
@@ -287,3 +312,17 @@ class RAGPipeline:
                 "steps": steps,
             },
         }
+
+
+_pipeline_instance: "RAGPipeline | None" = None
+
+
+def get_pipeline(settings: Settings | None = None) -> "RAGPipeline":
+    """全局单例，供知识库后台发布/下架后重建 BM25 使用。
+
+    注意：KB 操作后需显式调用 rebuild_bm25() 让稀疏索引与向量库同步。
+    """
+    global _pipeline_instance
+    if _pipeline_instance is None:
+        _pipeline_instance = RAGPipeline(settings or get_settings())
+    return _pipeline_instance

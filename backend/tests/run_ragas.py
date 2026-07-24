@@ -100,8 +100,10 @@ def main() -> None:
     ap = argparse.ArgumentParser()
     ap.add_argument("--provider", default="all", choices=PROVIDERS + ["all"])
     ap.add_argument("--out", default="benchmark_report.md")
+    ap.add_argument("--tag", default="", help="答案文件标签，如 v1；加载 answers_{tag}_{provider}.jsonl")
     args = ap.parse_args()
     provs = PROVIDERS if args.provider == "all" else [args.provider]
+    tag = args.tag.strip()
 
     _load_dotenv(BASE / ".env")
 
@@ -155,7 +157,7 @@ def main() -> None:
     report_lines.append("|---|---|---|---|---|")
 
     for p in provs:
-        path = OUT_DIR / f"answers_{p}.jsonl"
+        path = OUT_DIR / (f"answers_{tag}_{p}.jsonl" if tag else f"answers_{p}.jsonl")
         if not path.exists():
             print(f"[跳过] 缺少 {path.name}")
             continue
@@ -192,7 +194,7 @@ def main() -> None:
                 f"{r['context_precision']:.3f} | {r['context_recall']:.3f} |"
             )
 
-    out_path = BASE / args.out
+    out_path = BASE / (f"benchmark_report_{tag}.md" if tag else args.out)
     out_path.write_text("\n".join(report_lines), encoding="utf-8")
     print(f"\n报告已写入 {out_path}")
 

@@ -8,10 +8,12 @@ from pathlib import Path
 from app.config import get_settings
 from app.log import get_logger
 from app.rag.embeddings import EmbeddingClient
-from app.rag.vectorstore import get_vector_store
+from app.rag.vectorstore import get_vector_store, point_id
 
 log = get_logger("data.ingest")
 DATA_PATH = Path(__file__).parent / "mediation_cases.json"
+# 入库管道（app/ingest）产出的文档持久化索引，与种子案例合并为统一检索源
+INGESTED_JSONL = Path(__file__).parent / "ingested.jsonl"
 
 
 def _embed_text(doc: dict) -> str:
@@ -22,7 +24,14 @@ def _embed_text(doc: dict) -> str:
 
 def load_documents() -> list[dict]:
     with open(DATA_PATH, "r", encoding="utf-8") as f:
-        return json.load(f)
+        docs = json.load(f)
+    # 合并入库管道产生的文档（文件入库），作为 BM25 与统一检索源的补充
+    if INGESTED_JSONL.exists():
+        with open(INGESTED_JSONL, "r", encoding="utf-8") as f:
+            for line in f:
+                if line.strip():
+                    docs.append(json.loads(line))
+    return docs
 
 
 def build_points(docs: list[dict], embedder: EmbeddingClient) -> list[dict]:
@@ -32,7 +41,7 @@ def build_points(docs: list[dict], embedder: EmbeddingClient) -> list[dict]:
     for doc, vec in zip(docs, vectors):
         points.append(
             {
-                "id": abs(hash(doc["id"])) % (2**63),
+                "id": point_id(doc["id"]),
                 "vector": vec,
                 "payload": {
                     "id": doc["id"],
