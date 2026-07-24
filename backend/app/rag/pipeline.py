@@ -188,9 +188,12 @@ class RAGPipeline:
             log.warning("[%s] 诚实拒答 | 最佳相关度=%.4f < 阈值=%.4f | 重试=%d", trace_id, best, thr, retries)
             return self._wrap(trace_id, steps, t_total, "retrieve", honest, [], retries, provider)
 
-        answer = self._generate(question, ranked, provider, trace_id, steps)
-        log.info("[%s] 完成 | 路由=retrieve 来源数=%d 重试=%d", trace_id, len(ranked), retries)
-        return self._wrap(trace_id, steps, t_total, "retrieve", answer, ranked, retries, provider)
+        # 用户角色感知：决定答案视角（居民/调解员/物业）
+        role = self._infer_role(question)
+        mark("infer_role", f"role={role}")
+        answer = self._generate(question, ranked, provider, trace_id, steps, role=role)
+        log.info("[%s] 完成 | 路由=retrieve 来源数=%d 重试=%d 角色=%s", trace_id, len(ranked), retries, role)
+        return self._wrap(trace_id, steps, t_total, "retrieve", answer, ranked, retries, provider, user_role=role)
 
     def _retrieve(self, query: str, trace_id: str, steps: list, retry: int = 0) -> tuple[list[dict], float]:
         t = time.perf_counter()
@@ -231,7 +234,56 @@ class RAGPipeline:
         })
         return ranked, best
 
-    def _generate(self, question: str, sources: list[dict], provider: str, trace_id: str, steps: list) -> str:
+    # ---------- 用户角色感知（Agent 能力：让答案服从对话对象身份） ----------
+    def _infer_role(self, question: str) -> str:
+        """从用户措辞推断其身份，用于决定答案视角。
+
+        默认 'resident'（居民/当事人/投诉人）——因为我们面对的主要是来维权的居民；
+        命中调解/社区工作口吻则判定为 'mediator'；命中物业职责口吻为 'property'。
+        """
+        q = question
+        if any(k in q for k in [
+            "接案", "接到投诉", "受理登记", "如何调解", "怎么调解", "调解流程",
+            "组织座谈", "上门走访", "回访", "调处", "社区工作站", "网格员", "网格",
+        ]):
+            return "mediator"
+        if any(k in q for k in [
+            "物业怎么", "作为物业", "物业如何", "管家", "巡查记录", "物业上报", "工程维修单",
+        ]):
+            return "property"
+        # 居民 / 当事人 / 投诉人（含显式自述或默认）
+        return "resident"
+
+    def _role_guidance(self, role: str) -> str:
+        """按角色返回生成约束，嵌进 _generate 的提示词。"""
+        if role == "mediator":
+            return (
+                "【对话对象】社区调解员 / 社工。TA 需要接案处置流程与约谈技巧。\n"
+                "【回答要求】按调解工作专业流程组织：受理登记要点 → 核实与走访 → 组织调解/座谈"
+                " → 签订约定与回访。可直接引用知识库处置步骤原文，使用专业口吻，不必过度共情。\n"
+            )
+        if role == "property":
+            return (
+                "【对话对象】物业服务人员。TA 需要物业视角的处置动作（巡查、记录、上报、协助）。\n"
+                "【回答要求】从物业职责角度给可执行动作：现场核实、台账记录、协调工程/安保、"
+                "向业主反馈、上报社区等。使用物业工作口吻。\n"
+            )
+        # resident（默认）：居民 / 当事人 / 投诉人（维权视角）
+        return (
+            "【对话对象】遇到矛盾的居民 / 当事人 / 投诉人（受害者视角，此刻焦虑、想维权）。\n"
+            "【回答要求】\n"
+            "1) 先共情一句（如『别急，理解你的困扰』）再给建议；\n"
+            "2) 用大白话，站在『你（居民）能做什么』的角度。注意：知识库资料很多是从"
+            "『调解员应做 X』的视角写的，你必须把这类表述**转换**为对居民的具体行动建议"
+            "（例：『调解员应上门走访』→『你可以先请物业或社区上门核实，并自己用手机留存录音/视频证据』）；"
+            "绝不能直接把『调解员要做的事』当成『你要做的事』丢给用户。\n"
+            "3) 若关键信息不足（吵了多久、找过物业没、对方态度、有无书面/视听证据），主动引导补充，"
+            "先追问 1-2 个问题再给完整建议，效果远好于一次性罗列。\n"
+            "4) 一次只给最紧急、最可执行的 2-4 条，不要堆砌长清单；每条配一句『为什么这么做』。\n"
+            "5) 法条作为支撑标注，用居民能懂的话解释，不要念法条原文唬人。\n"
+        )
+
+    def _generate(self, question: str, sources: list[dict], provider: str, trace_id: str, steps: list, role: str = "resident") -> str:
         ctx_blocks = []
         for i, s in enumerate(sources, 1):
             p = s["payload"]
@@ -244,8 +296,13 @@ class RAGPipeline:
         context = "\n\n".join(ctx_blocks)
         # v2：严格接地提示词——只依据检索资料，不补未见于资料的法条/事实，
         # 资料不足即诚实拒答。这是提升 RAGAS faithfulness 的关键改动。
+        # v3：叠加【用户角色感知】——根据对话对象身份切换答案视角，
+        # 把知识库（多为调解员操作手册视角）转换为对应用户角色的可执行建议。
+        role_label = {"resident": "居民/当事人（维权视角）", "mediator": "调解员/社工", "property": "物业服务人员"}[role]
+        role_g = self._role_guidance(role)
         prompt = (
             "你是社区矛盾调解助理，必须严格基于下方「相关资料」作答。\n"
+            f"本次对话识别到的【用户身份】={role_label}\n{role_g}\n"
             "硬性要求：\n"
             "1) 只使用资料中【明确出现】的事实、法条、调解步骤；严禁自行补充资料未提及的法律结论、"
             "法条名称、处罚措施、时限或任何外部知识。\n"
@@ -263,6 +320,7 @@ class RAGPipeline:
                     "content": (
                         "社区矛盾调解助理。你的全部回答必须严格依据用户提供的检索资料，"
                         "绝不外推或编造资料中不存在的法条与事实；资料不足时如实告知。"
+                        f"本次对话对象身份为：{role_label}，请从该角色视角组织回答。"
                     ),
                 },
                 {"role": "user", "content": prompt},
@@ -280,7 +338,7 @@ class RAGPipeline:
         })
         return answer
 
-    def _wrap(self, trace_id, steps, t_total, route, answer, sources, retries, provider) -> dict[str, Any]:
+    def _wrap(self, trace_id, steps, t_total, route, answer, sources, retries, provider, user_role: str | None = None) -> dict[str, Any]:
         # 来源展示门槛：相关度低于阈值的命中视为噪音，不展示给用户
         min_score = self.s.source_display_min_score
         shown = [
@@ -290,6 +348,7 @@ class RAGPipeline:
         return {
             "trace_id": trace_id,
             "route": route,
+            "user_role": user_role,
             "answer": answer,
             "sources": [
                 {
