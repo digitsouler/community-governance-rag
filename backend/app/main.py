@@ -132,7 +132,7 @@ class Handler(BaseHTTPRequestHandler):
         length = int(self.headers.get("Content-Length", 0))
         raw = self.rfile.read(length) if length else b"{}"
         try:
-            data = json.loads(raw or b"{}")
+            data = json.loads((raw or b"{}").decode("utf-8", errors="replace"))
         except json.JSONDecodeError:
             self._send(400, {"error": "invalid json"})
             return

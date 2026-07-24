@@ -306,8 +306,11 @@ class RAGPipeline:
         # 居民 / 当事人 / 投诉人（含显式自述或默认）
         return "resident"
 
-    def _role_guidance(self, role: str) -> str:
+    def _role_guidance(self, role: str, known_facts: dict[str, str] | None = None) -> str:
         """按角色返回生成约束，嵌进 _generate 的提示词。"""
+        known = known_facts or {}
+        # 已知维度列表，用于在追问指令中排除
+        known_dims = "、".join(known.keys()) if known else ""
         if role == "mediator":
             return (
                 "【对话对象】社区调解员 / 社工。TA 需要接案处置流程与约谈技巧。\n"
@@ -321,6 +324,18 @@ class RAGPipeline:
                 "向业主反馈、上报社区等。使用物业工作口吻。\n"
             )
         # resident（默认）：居民 / 当事人 / 投诉人（维权视角）
+        # 核心原则：【先给建议，追问是附注】。用户来这里是求解决方案的，
+        # 不是来接受面试的。每轮都追问会让用户非常烦躁。
+        ask_rule = (
+            f"3) 【默认给建议】基于已有信息直接给出 2-4 条可执行建议。"
+            f"只在信息确实严重不足、且不补充就给不出有效建议时，才可在建议末尾简短提一句还需要什么信息。"
+            f"【严禁追问以下用户已告知的维度】：{known_dims}。"
+            f"绝对不要每轮都追问，不要当面试官。"
+            if known_dims else
+            "3) 【默认给建议】基于已有信息直接给出 2-4 条可执行建议。"
+            "不要每轮都追问用户问题——用户来这里是求解决方案的，不是来接受面试的。"
+            "只在信息确实严重不足时，才可在建议末尾简短提一句还需要什么信息。"
+        )
         return (
             "【对话对象】遇到矛盾的居民 / 当事人 / 投诉人（受害者视角，此刻焦虑、想维权）。\n"
             "【回答要求】\n"
@@ -329,11 +344,99 @@ class RAGPipeline:
             "『调解员应做 X』的视角写的，你必须把这类表述**转换**为对居民的具体行动建议"
             "（例：『调解员应上门走访』→『你可以先请物业或社区上门核实，并自己用手机留存录音/视频证据』）；"
             "绝不能直接把『调解员要做的事』当成『你要做的事』丢给用户。\n"
-            "3) 若关键信息不足（吵了多久、找过物业没、对方态度、有无书面/视听证据），主动引导补充，"
-            "先追问 1-2 个问题再给完整建议，效果远好于一次性罗列。\n"
+            f"{ask_rule}\n"
             "4) 一次只给最紧急、最可执行的 2-4 条，不要堆砌长清单；每条配一句『为什么这么做』。\n"
             "5) 法条作为支撑标注，用居民能懂的话解释，不要念法条原文唬人。\n"
         )
+
+    # ---------- 已知事实提取（防止重复追问已回答的信息） ----------
+    # 常见关键事实维度 + 对应的口语关键词（覆盖居民常用表达方式）
+    _FACT_DIMENSIONS = {
+        "持续时间": ["持续", "多久", "几天", "几个月", "好久了", "一直", "经常",
+                     "天天", "每天", "每晚", "偶尔", "一次", "频率", "频次"],
+        "是否已沟通": ["沟通过", "找过他", "说过", "跟他讲", "找过楼上", "找过对方",
+                      "找过邻居", "反映过", "跟他说了", "交涉", "协商"],
+        "沟通结果/对方态度": ["不改", "不听", "不理", "骂回来", "态度差", "不认",
+                             "推脱", "敷衍", "答应但没做", "口头答应", "没用", "无效"],
+        "是否找过物业/社区": ["物业", "管家", "管理处", "居委会", "社区", "调解员",
+                            "报警", "派出所", "110", "12345", "街道"],
+        "证据情况": ["录音", "录像", "视频", "拍照", "截图", "聊天记录", "微信",
+                    "留证", "证据", "拍下来", "录下来"],
+        "影响程度": ["睡不着", "睡不好", "影响休息", "影响学习", "小孩", "孩子",
+                    "老人", "病人", "神经衰弱", "精神", "质量差"],
+    }
+
+    def _extract_known_facts(self, history: list[dict] | None) -> dict[str, str]:
+        """扫描对话历史，提取用户已透露的关键事实。
+
+        返回 {维度: 摘要}，用于注入提示词，让 LLM 明确知道「什么已经知道了、不要再问」。
+        """
+        if not history:
+            return {}
+        facts: dict[str, str] = {}
+        # 逐轮扫描用户发言（保留自然句边界），从最近往前找
+        for m in reversed(history):
+            if m["role"] not in ("user",):
+                continue
+            # 按中英文句号/感叹号/问号/逗号/空格/换行分句（覆盖无标点口语）
+            sentences = re.split(r"[。！？.!?,，\s\n]+", m["content"])
+            for sent in sentences:
+                sent = sent.strip()
+                if len(sent) < 4:
+                    continue
+                for dim, keywords in self._FACT_DIMENSIONS.items():
+                    if dim in facts:
+                        continue  # 该维度已找到，跳过
+                    for kw in keywords:
+                        if kw in sent:
+                            # 截取关键词前后各 40 字符的窗口作为摘要（保持上下文）
+                            idx = sent.find(kw)
+                            start = max(0, idx - 20)
+                            end = min(len(sent), idx + len(kw) + 40)
+                            snippet = sent[start:end].strip()
+                            if len(snippet) >= 6:
+                                facts[dim] = snippet[:80]
+                            break
+            # 所有维度都找到就提前结束
+            if len(facts) >= len(self._FACT_DIMENSIONS):
+                break
+        return facts
+
+    # ---------- AI 已问问题追踪（防止 AI 重复问同一个问题） ----------
+    _QUESTION_PATTERNS = [
+        r"有没有.*记录|有没有.*录音|有没有.*录像|有没有.*截图|有没有.*证据|有没有.*照片",
+        r"持续.*多久|多久了|几天.*了|什么时候开始的|几点.*开始|持续到",
+        r"沟通过.*没|找过.*没|跟.*说过.*没|有没有.*沟通|有没有.*交涉|有没有.*协商",
+        r"对方.*什么态度|他.*怎么回应|他.*怎么说|对方.*反应",
+        r"物业.*没|社区.*没|居委会.*没|报警.*没|派出所.*没|12345.*没|街道.*没|管家.*没",
+        r"影响.*怎样|影响.*如何|睡得好不好|休息.*影响|学习.*影响|工作.*影响",
+    ]
+
+    def _extract_asked_questions(self, history: list[dict] | None) -> list[str]:
+        """从 AI 自己的历史回答中提取已经问过用户的问题摘要。
+
+        解决的问题是：AI 在第2轮问了「有没有留下录音」，第4轮又问完全一样的问题。
+        _extract_known_facts 只能追踪用户说过的信息，但无法阻止 AI 重复自己的提问。
+        这里扫描 assistant 历史消息，用正则匹配追问句式，返回已问过的问题列表。
+        """
+        if not history:
+            return []
+        asked: list[str] = []
+        seen: set[str] = set()
+        for m in history:
+            if m.get("role") not in ("assistant", "bot"):
+                continue
+            text = m.get("content", "")
+            for pat in self._QUESTION_PATTERNS:
+                match = re.search(pat, text)
+                if match:
+                    q = match.group(0).strip()
+                    # 归一化：去掉开头通用词便于去重
+                    key = re.sub(r"^[有没有是否]", "", q).strip()[:30]
+                    if key not in seen and len(q) >= 6:
+                        seen.add(key)
+                        asked.append(q)
+        return asked
 
     def _generate(self, question: str, sources: list[dict], provider: str, trace_id: str, steps: list, role: str = "resident", history: list[dict] | None = None) -> str:
         ctx_blocks = []
@@ -350,11 +453,36 @@ class RAGPipeline:
         # 资料不足即诚实拒答。这是提升 RAGAS faithfulness 的关键改动。
         # v3：叠加【用户角色感知】——根据对话对象身份切换答案视角，
         # 把知识库（多为调解员操作手册视角）转换为对应用户角色的可执行建议。
+        # v4：叠加【已知事实感知】——从历史提取用户已回答的关键信息，
+        # 禁止重复追问已知事项（这是导致用户体验差的核心原因）。
+        # v5：叠加【AI 已问问题追踪】——从 AI 自己的历史回答中提取已问过的问题，
+        # 防止 AI 在不同轮次重复问同一个问题（如反复问"有没有录音"）。
+        known = self._extract_known_facts(history)
+        asked = self._extract_asked_questions(history)
         role_label = {"resident": "居民/当事人（维权视角）", "mediator": "调解员/社工", "property": "物业服务人员"}[role]
-        role_g = self._role_guidance(role)
+        role_g = self._role_guidance(role, known)
+        fact_block = ""
+        if known:
+            fact_lines = "\n".join(f"  - {k}：{v}" for k, v in known.items())
+            fact_block = (
+                f"\n【用户已在对话中透露的信息（绝对不要再问这些）】\n"
+                f"{fact_lines}\n"
+                f"以上信息用户已经告诉你了，直接基于这些已知条件给下一步建议，"
+                f"严禁以任何形式再次询问上述已知的维度。\n"
+            )
+        asked_block = ""
+        if asked:
+            asked_lines = "\n".join(f"  - {q}" for q in asked)
+            asked_block = (
+                f"\n【你在之前的回答中已经问过的问题（绝对不要再问同样的内容）】\n"
+                f"{asked_lines}\n"
+                f"以上问题你已经在前面问过用户了，重复提问会让用户觉得你不专业、"
+                f"没有在听。直接基于已有信息给建议，或问一个全新的、从未问过的角度。\n"
+            )
         prompt = (
             "你是社区矛盾调解助理，必须严格基于下方「相关资料」作答。\n"
-            f"本次对话识别到的【用户身份】={role_label}\n{role_g}\n"
+            f"本次对话识别到的【用户身份】={role_label}\n{role_g}"
+            f"{fact_block}{asked_block}"
             "硬性要求：\n"
             "1) 只使用资料中【明确出现】的事实、法条、调解步骤；严禁自行补充资料未提及的法律结论、"
             "法条名称、处罚措施、时限或任何外部知识。\n"
@@ -373,9 +501,16 @@ class RAGPipeline:
                     "社区矛盾调解助理。你的全部回答必须严格依据用户提供的检索资料，"
                     "绝不外推或编造资料中不存在的法条与事实；资料不足时如实告知。"
                     f"本次对话对象身份为：{role_label}，请从该角色视角组织回答。"
-                    "这是一段【连续对话】：用户的当前发言可能是在回答你上一轮的追问，"
-                    "务必结合上文语境理解，紧扣同一件事继续，切勿跳到无关话题；"
-                    "若用户已补充了此前追问的信息，就不要重复追问，直接给出下一步建议。"
+                    "这是一段【连续对话】，核心纪律："
+                    "1) 用户的当前发言可能是在回答你上一轮的追问，务必结合上文语境理解；"
+                    "2) 【绝对禁止重复追问】——若用户已在历史对话中透露过某项信息（如持续时长、"
+                    "是否沟通过、对方态度、是否找过物业等），你绝不能再问同一维度的问题，"
+                    "这会让用户非常愤怒；直接基于已知信息推进到下一步建议；"
+                    "3) 【绝对禁止重复自己问过的问题】——如果你在之前的回答中已经问过"
+                    "「有没有录音/录像」「持续多久」「有没有找过物业」等问题，绝不能再问"
+                    "同样或类似的问题，即使用户还没有回答。这会让你显得没有在听、非常不专业；"
+                    "4) 只在确实缺少某个关键维度、且用户从未提及、你也从未问过时，才可追问一项；"
+                    "   且追问必须放在建议的末尾作为附注，而不是把追问当成回答的主体。"
                 ),
             },
         ]
