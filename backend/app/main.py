@@ -3,7 +3,11 @@
 接口：
   GET  /api/health           健康检查 + 知识库条数
   GET  /api/models           可用模型列表
-  POST /api/chat             矛盾调解问答 { question, provider?, history?:[{role,content}] }
+  POST /api/chat             矛盾调解问答 { question, provider?, session_id?, history? }
+  POST /api/sessions         新建会话（返回 session_id）
+  GET  /api/sessions         会话列表（按更新时间倒序，含首问摘要）
+  GET  /api/sessions/{id}    会话完整消息
+  DELETE /api/sessions/{id}  删除会话
 
   GET  /api/kb/stats         知识库统计（总数/已发布/草稿/分块/类别分布）
   GET  /api/kb/docs          文档列表（支持 ?status=&category=&page=&size=）
@@ -36,6 +40,8 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from app.config import MODEL_REGISTRY, get_settings
 from app.log import get_logger, setup_logging
 from app.rag.pipeline import RAGPipeline
+from app.profile_store import get_profile_store
+from app.session_store import get_session_store
 
 log = get_logger("app.main")
 settings = get_settings()
@@ -124,6 +130,24 @@ class Handler(BaseHTTPRequestHandler):
                 self._send(200, {"status": "ok", **doc})
                 return
             self._send(400, {"error": "路径格式错误，应为 /api/kb/{id}/content"})
+        # 会话：列表
+        elif path == "/api/sessions":
+            items = get_session_store().list_sessions()
+            self._send(200, {"status": "ok", "sessions": items})
+        # 会话：完整消息
+        elif path.startswith("/api/sessions/") and len([p for p in path.split("/") if p]) == 3:
+            sid = unquote(path.split("/")[3])
+            sess = get_session_store().get_session(sid)
+            if sess is None:
+                self._send(404, {"error": "会话不存在"})
+                return
+            self._send(200, {"status": "ok", "session": sess,
+                             "messages": get_session_store().get_messages(sid)})
+        # 会话：结构化案件档案（长期记忆）
+        elif path.startswith("/api/sessions/") and path.endswith("/profile"):
+            sid = unquote(path.split("/")[3])
+            prof = get_profile_store().get(sid)
+            self._send(200, {"status": "ok", "session_id": sid, "profile": prof})
         else:
             self._send(404, {"error": "not found"})
 
@@ -135,6 +159,57 @@ class Handler(BaseHTTPRequestHandler):
             data = json.loads((raw or b"{}").decode("utf-8", errors="replace"))
         except json.JSONDecodeError:
             self._send(400, {"error": "invalid json"})
+            return
+
+        # 会话：新建
+        if path == "/api/sessions":
+            sid = get_session_store().create_session()
+            self._send(200, {"status": "ok", "session_id": sid})
+            return
+
+        # 问答
+        if path == "/api/chat":
+            question = (data.get("question") or "").strip()
+            provider = data.get("provider")
+            session_id = (data.get("session_id") or "").strip()
+            if not question:
+                self._send(400, {"error": "question 不能为空"})
+                return
+            # 短期记忆：会话历史从 Redis(或内存) 按 session_id 拉取，不再依赖前端传 history
+            store = get_session_store()
+            if session_id:
+                history = store.get_messages(session_id)
+            else:
+                # 兼容旧调用：无 session_id 则新建会话并把前端传来的 history 种入
+                session_id = store.create_session()
+                history = data.get("history") or []
+                if isinstance(history, list):
+                    for m in history:
+                        if isinstance(m, dict) and m.get("role") in ("user", "assistant", "bot") and m.get("content"):
+                            store.append_message(session_id, "user" if m["role"] == "user" else "assistant", m["content"])
+            if not isinstance(history, list):
+                history = []
+            history = history[-12:]  # 兜底截断，pipeline 内部还会再规整
+            if provider and provider not in MODEL_REGISTRY:
+                provider = None
+            req_id = uuid.uuid4().hex[:12]
+            t0 = time.perf_counter()
+            log.info("[%s] POST /api/chat | sid=%s | provider=%s | 历史=%d | q=%r",
+                     req_id, session_id, provider or settings.default_llm, len(history), question[:60])
+            try:
+                # 先落「用户问题」到会话存储，再生成答案
+                store.append_message(session_id, "user", question)
+                result = pipeline.query(question, provider, history=history, session_id=session_id)
+                result["trace_id"] = result.get("trace_id", req_id)
+                store.append_message(session_id, "assistant", result["answer"])
+                result["session_id"] = session_id
+                dt = (time.perf_counter() - t0) * 1000
+                log.info("[%s] 响应 | code=200 | route=%s | 耗时=%.0fms", req_id, result["route"], dt)
+                self._send(200, result, trace_id=result["trace_id"])
+            except Exception as e:
+                dt = (time.perf_counter() - t0) * 1000
+                log.error("[%s] 处理异常 | code=500 | 耗时=%.0fms | %s", req_id, dt, e)
+                self._send(500, {"error": str(e), "trace_id": req_id})
             return
 
         # 知识库：上传
@@ -230,39 +305,19 @@ class Handler(BaseHTTPRequestHandler):
             self._send(200, {"status": "ok", "action": action, "doc_id": doc_id})
             return
 
-        # 问答
-        if path == "/api/chat":
-            question = (data.get("question") or "").strip()
-            provider = data.get("provider")
-            # 多轮对话：接收前端传来的历史（[{role, content}]），容错限制条数
-            history = data.get("history")
-            if not isinstance(history, list):
-                history = []
-            history = history[-12:]  # 兜底截断，pipeline 内部还会再规整
-            if not question:
-                self._send(400, {"error": "question 不能为空"})
-                return
-            if provider and provider not in MODEL_REGISTRY:
-                provider = None
-            req_id = uuid.uuid4().hex[:12]
-            t0 = time.perf_counter()
-            log.info("[%s] POST /api/chat | provider=%s | 历史=%d | q=%r", req_id, provider or settings.default_llm, len(history), question[:60])
-            try:
-                result = pipeline.query(question, provider, history=history)
-                result["trace_id"] = result.get("trace_id", req_id)
-                dt = (time.perf_counter() - t0) * 1000
-                log.info("[%s] 响应 | code=200 | route=%s | 耗时=%.0fms", req_id, result["route"], dt)
-                self._send(200, result, trace_id=result["trace_id"])
-            except Exception as e:
-                dt = (time.perf_counter() - t0) * 1000
-                log.error("[%s] 处理异常 | code=500 | 耗时=%.0fms | %s", req_id, dt, e)
-                self._send(500, {"error": str(e), "trace_id": req_id})
-        else:
-            self._send(404, {"error": "not found"})
+        self._send(404, {"error": "not found"})
 
     def do_DELETE(self):
         path = urlparse(self.path).path
         parts = [p for p in path.split("/") if p]
+        # /api/sessions/{id}
+        if len(parts) == 3 and parts[0] == "api" and parts[1] == "sessions":
+            sid = unquote(parts[2])
+            if not get_session_store().delete_session(sid):
+                self._send(404, {"error": f"会话不存在：{sid}"})
+                return
+            self._send(200, {"status": "ok", "action": "delete", "session_id": sid})
+            return
         # /api/kb/{id}
         if len(parts) == 3 and parts[0] == "api" and parts[1] == "kb":
             doc_id = unquote(parts[2])

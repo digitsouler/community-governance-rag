@@ -45,6 +45,11 @@ class Settings(BaseSettings):
     collection_name: str = "community_mediation"
     vector_dim: int = 2048  # 智谱 embedding-3 维度
 
+    # ---- 短期记忆（会话存储）----
+    # 留空则内存降级模式（无需起 Redis，便于无依赖开发）；
+    # 填 redis://host:port 启用 Redis 持久化会话（推荐生产/本地）。
+    redis_url: str = "redis://127.0.0.1:6379"
+
     # ---- 检索参数 ----
     top_k: int = 8
     rerank_top_k: int = 4

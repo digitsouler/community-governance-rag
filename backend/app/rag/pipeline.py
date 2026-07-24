@@ -17,6 +17,8 @@ from typing import Any
 
 from app.config import ProviderName, Settings, get_settings
 from app.log import get_logger
+from app.experience_store import get_experience_store
+from app.profile_store import get_profile_store
 from app.rag.embeddings import EmbeddingClient
 from app.rag.hybrid import BM25Index, rrf_fuse
 from app.rag.llm import LLMClient
@@ -68,6 +70,10 @@ class RAGPipeline:
         except Exception as e:
             log.warning("BM25 索引构建失败，混合检索降级为纯向量：%s", e)
             self.bm25._built = False
+        # 长期记忆（P1）：结构化案件档案存储（Redis 优先，内存降级）
+        self._profiles = get_profile_store()
+        # 长期记忆（P3）：跨会话经验向量库（Qdrant 优先，内存降级）
+        self._exp = get_experience_store()
 
     def rebuild_bm25(self):
         """用向量库当前全部 payload 重建稀疏索引，使其与检索源完全一致。
@@ -174,6 +180,7 @@ class RAGPipeline:
         question: str,
         provider: ProviderName | None = None,
         history: list[dict] | None = None,
+        session_id: str | None = None,
     ) -> dict[str, Any]:
         trace_id = uuid.uuid4().hex[:12]
         provider = provider or self.s.default_llm
@@ -187,6 +194,27 @@ class RAGPipeline:
             steps.append({"stage": stage, "detail": detail, "ms": round(ms, 1) if ms is not None else None})
 
         log.info("[%s] 新请求 | provider=%s | q=%r", trace_id, provider, question[:60])
+
+        # v6：纯感谢/客套消息短路——在路由之前拦截，不走 LLM
+        _GRATITUDE_KW = ["谢谢", "感谢", "真好", "太好了", "有用", "有帮助",
+                         "不错", "厉害", "给力", "棒", "辛苦了"]
+        _NOT_PURE = ["但是", "不过", "可是", "还有个", "另外", "接下来", "然后"]
+        is_pure_thanks = (
+            any(kw in question for kw in _GRATITUDE_KW)
+            and len(question.strip()) < 30
+            and not any(x in question for x in _NOT_PURE)
+        )
+        if is_pure_thanks:
+            import random
+            replies = [
+                "不客气，有需要随时问。",
+                "能帮到你就好，有问题再找我。",
+                "不客气，希望对你有帮助！",
+                "应该的，有问题随时说。",
+            ]
+            mark("supervise", "route=gratitude-shortcut")
+            return self._wrap(trace_id, steps, t_total, "direct",
+                              random.choice(replies), [], 0, provider)
 
         # Supervisor 路由（有历史时，短追答不再误判为 clarify）
         t = time.perf_counter()
@@ -212,7 +240,16 @@ class RAGPipeline:
         if query != question:
             log.info("[%s] 上下文合并检索 | %r -> %r", trace_id, question, query)
             steps.append({"stage": "context_merge", "detail": f"{question!r} -> {query!r}", "ms": None})
-        ranked, best = self._retrieve(query, trace_id, steps)
+        # 复用同一查询向量：知识库检索 + 长期经验检索（避免重复 embedding）
+        qvec = self.embedder.embed_query(query)
+        # 长期记忆（P3）：检索其他相似历史案件经验，作为本轮参考
+        experiences = []
+        if session_id:
+            try:
+                experiences = self._exp.search(qvec, top_k=3, exclude_sid=session_id)
+            except Exception as e:  # noqa: BLE001
+                log.warning("[%s] 长期经验检索失败（跳过）：%s", trace_id, e)
+        ranked, best = self._retrieve(query, trace_id, steps, query_vec=qvec)
         retries = 0
         while best < thr and retries < self.s.max_retrieve_retries:
             new_query = self._reformulate(query)
@@ -240,13 +277,38 @@ class RAGPipeline:
         # 用户角色感知：决定答案视角（居民/调解员/物业）——参考历史，避免追答丢失身份
         role = self._infer_role(question, history)
         mark("infer_role", f"role={role}")
-        answer = self._generate(question, ranked, provider, trace_id, steps, role=role, history=history)
+        # 长期记忆（P1）：载入该会话已沉淀的结构化案件档案，作为本轮事实源注入
+        case_profile = self._profiles.get(session_id) if session_id else None
+        answer = self._generate(question, ranked, provider, trace_id, steps, role=role, history=history, profile=case_profile, experiences=experiences)
+        # 长期记忆（P1）：本轮结束后更新并持久化案件档案（合并累积，不丢历史事实）
+        if session_id:
+            existing = case_profile or {}
+            fresh = self._build_case_profile(history, question, role)
+            merged = self._merge_profile(existing, fresh)
+            self._profiles.save(session_id, merged)
+            case_profile = merged
+            # 长期记忆（P3）：把本案画像向量化写入经验库，供未来相似案件检索复用
+            try:
+                exp_text = self._experience_text(merged)
+                exp_vec = self.embedder.embed_query(exp_text)
+                self._exp.upsert(session_id, exp_vec, {
+                    "session_id": session_id,
+                    "case_type": merged.get("case_type", ""),
+                    "opponent": merged.get("opponent", ""),
+                    "identity": merged.get("identity", ""),
+                    "stage": merged.get("stage", ""),
+                    "evidence_status": merged.get("evidence_status", ""),
+                    "key_facts": merged.get("key_facts", {}),
+                    "updated_at": time.time(),
+                })
+            except Exception as e:  # noqa: BLE001
+                log.warning("[%s] 长期经验写入失败（跳过）：%s", trace_id, e)
         log.info("[%s] 完成 | 路由=retrieve 来源数=%d 重试=%d 角色=%s", trace_id, len(ranked), retries, role)
-        return self._wrap(trace_id, steps, t_total, "retrieve", answer, ranked, retries, provider, user_role=role)
+        return self._wrap(trace_id, steps, t_total, "retrieve", answer, ranked, retries, provider, user_role=role, case_profile=case_profile, experiences=experiences)
 
-    def _retrieve(self, query: str, trace_id: str, steps: list, retry: int = 0) -> tuple[list[dict], float]:
+    def _retrieve(self, query: str, trace_id: str, steps: list, retry: int = 0, query_vec: list[float] | None = None) -> tuple[list[dict], float]:
         t = time.perf_counter()
-        vec = self.embedder.embed_query(query)
+        vec = query_vec if query_vec is not None else self.embedder.embed_query(query)
         dense = self.store.search(vec, top_k=self.s.top_k)
 
         # 混合检索：稠密 ∪ 稀疏(BM25) → RRF 融合扩大候选池 → rerank 精排
@@ -352,12 +414,18 @@ class RAGPipeline:
     # ---------- 已知事实提取（防止重复追问已回答的信息） ----------
     # 常见关键事实维度 + 对应的口语关键词（覆盖居民常用表达方式）
     _FACT_DIMENSIONS = {
-        "持续时间": ["持续", "多久", "几天", "几个月", "好久了", "一直", "经常",
-                     "天天", "每天", "每晚", "偶尔", "一次", "频率", "频次"],
+        "起止时间": ["几点", "几点钟", "早上", "中午", "下午", "晚上", "凌晨", "半夜",
+                    "深夜", "从.*点", "到.*点", "开始.*搞", "搞到", "持续到",
+                    "一直搞到", "搞到.*才", "从.*开始", "到.*结束", "到.*才停",
+                    "上午", "傍晚", "夜里", "通宵", "整晚"],
+        "持续时间/频率": ["持续", "多久", "几天", "几个月", "好久了", "一直", "经常",
+                     "天天", "每天", "每晚", "偶尔", "一次", "频率", "频次",
+                     "又开始了", "还是照样", "照旧", "依旧"],
         "是否已沟通": ["沟通过", "找过他", "说过", "跟他讲", "找过楼上", "找过对方",
-                      "找过邻居", "反映过", "跟他说了", "交涉", "协商"],
+                      "找过邻居", "反映过", "跟他说了", "交涉", "协商", "找过.*毛"],
         "沟通结果/对方态度": ["不改", "不听", "不理", "骂回来", "态度差", "不认",
-                             "推脱", "敷衍", "答应但没做", "口头答应", "没用", "无效"],
+                             "推脱", "敷衍", "答应但没做", "口头答应", "没用", "无效",
+                             "照样", "没改", "照旧", "依旧", "还是照样", "还是不改"],
         "是否找过物业/社区": ["物业", "管家", "管理处", "居委会", "社区", "调解员",
                             "报警", "派出所", "110", "12345", "街道"],
         "证据情况": ["录音", "录像", "视频", "拍照", "截图", "聊天记录", "微信",
@@ -366,40 +434,112 @@ class RAGPipeline:
                     "老人", "病人", "神经衰弱", "精神", "质量差"],
     }
 
-    def _extract_known_facts(self, history: list[dict] | None) -> dict[str, str]:
-        """扫描对话历史，提取用户已透露的关键事实。
+    def _extract_known_facts(self, history: list[dict] | None, current_question: str = "") -> dict[str, str]:
+        """扫描对话历史 + 当前用户输入，提取已透露的关键事实。
 
         返回 {维度: 摘要}，用于注入提示词，让 LLM 明确知道「什么已经知道了、不要再问」。
         """
-        if not history:
+        # 构造完整扫描列表：历史 + 当前问题（当前轮次的信息也要纳入）
+        all_user_msgs = list(history) if history else []
+        if current_question and len(current_question.strip()) >= 2:
+            all_user_msgs.append({"role": "user", "content": current_question})
+        if not all_user_msgs:
             return {}
         facts: dict[str, str] = {}
         # 逐轮扫描用户发言（保留自然句边界），从最近往前找
-        for m in reversed(history):
+        # 特殊处理：起止时间维度需要" richest match"——
+        #   "从9点开始搞到凌晨" >> "天天晚上搞"，所以不能首匹配即停。
+        _TIME_RICH_KEYWORDS = ("从.*点", "到.*点", "开始.*搞", "搞到", "持续到",
+                               "一直搞到", "\d+点", "\d+:\d+", "整晚", "通宵", "彻夜")
+        time_candidates: list[str] = []  # 收集所有起止时间候选，最后选最丰富的
+
+        for m in reversed(all_user_msgs):
             if m["role"] not in ("user",):
                 continue
+            text = m["content"]
             # 按中英文句号/感叹号/问号/逗号/空格/换行分句（覆盖无标点口语）
-            sentences = re.split(r"[。！？.!?,，\s\n]+", m["content"])
+            sentences = re.split(r"[。！？.!?,，\s\n]+", text)
             for sent in sentences:
                 sent = sent.strip()
                 if len(sent) < 4:
                     continue
                 for dim, keywords in self._FACT_DIMENSIONS.items():
+                    if dim == "起止时间":
+                        # 起止时间：收集所有候选不截断，后面统一选最优
+                        for kw in keywords:
+                            match = re.search(kw, sent)
+                            if match:
+                                idx = match.start()
+                                start = max(0, idx - 10)
+                                end = min(len(sent), idx + len(match.group(0)) + 30)
+                                candidate = sent[start:end].strip()
+                                if len(candidate) >= 4:
+                                    time_candidates.append(candidate)
+                        continue
                     if dim in facts:
                         continue  # 该维度已找到，跳过
                     for kw in keywords:
-                        if kw in sent:
-                            # 截取关键词前后各 40 字符的窗口作为摘要（保持上下文）
-                            idx = sent.find(kw)
+                        # 支持正则模式（如 "从.*点"）和纯子串（如 "天天"）
+                        match = re.search(kw, sent)
+                        if match:
+                            # 截取匹配位置前后各 20 字符的窗口作为摘要（保持上下文）
+                            idx = match.start()
                             start = max(0, idx - 20)
-                            end = min(len(sent), idx + len(kw) + 40)
+                            end = min(len(sent), idx + len(match.group(0)) + 40)
                             snippet = sent[start:end].strip()
-                            if len(snippet) >= 6:
+                            # 窗口过短（如口语短句被空格切开）时直接用整句
+                            if len(snippet) < 4:
+                                snippet = sent
+                            if len(snippet) >= 4:
                                 facts[dim] = snippet[:80]
                             break
-            # 所有维度都找到就提前结束
-            if len(facts) >= len(self._FACT_DIMENSIONS):
+            # 所有非时间维度都找到就可提前结束（起止时间单独处理）
+            non_time_found = sum(1 for d in facts if d != "起止时间")
+            if non_time_found >= len(self._FACT_DIMENSIONS) - 1:
                 break
+
+        # === 起止时间：从所有候选中选信息量最丰富的一条 ===
+        def _rich_score(s: str) -> int:
+            score = len(s)
+            if re.search(r"\d+[点:时：]", s): score += 50   # 含具体时刻
+            if any(w in s for w in ("凌晨", "半夜", "深夜", "通宵", "彻夜")): score += 40
+            if any(w in s for w in ("从", "到", "开始", "结束", "持续")): score += 20
+            return score
+
+        if time_candidates:
+            time_candidates.sort(key=_rich_score, reverse=True)
+            facts["起止时间"] = time_candidates[0][:80]
+
+        # === 补充扫描：起止时间经常跨逗号分句（如"从9点开始就搞，搞到凌晨"），
+        #     上述逐句扫描可能只抓到一半。这里对最新一条用户发言做整段正则补捞。 ===
+        if all_user_msgs:
+            latest = ""
+            for m in reversed(all_user_msgs):
+                if m.get("role") == "user":
+                    latest = m.get("content", "")
+                    break
+            if latest:
+                # 匹配 "从X点...到/搞到/持续到...Y点/凌晨/半夜" 等时间范围表达
+                time_patterns = [
+                    r"从.{0,6}点.{0,10}(到|搞到|持续到|一直).{0,6}(点|凌晨|半夜|深夜|早上|上午|下午|傍晚|夜里|通宵)",
+                    r".{0,4}点.{0,6}(开始|就开始).{0,15}(搞到|到|持续到).{0,6}(点|凌晨|半夜|深夜)",
+                    r"(早上|中午|下午|晚上|傍晚|凌晨|半夜|深夜).{0,8}(开始|就).{0,15}(搞|弄|吵|响).{0,10}(到|持续|一直到).{0,8}(点|凌晨|半夜|深夜|早上)",
+                    r"每天?从.{0,6}(点|左右).{0,15}(到|搞到|持续到).{0,6}(点|凌晨|半夜)",
+                    r"\d{1,2}[点:时]\D{0,10}(到|—|~|至|搞到|持续到)\D{0,10}\d{1,2}[点:时]",
+                    r"(整晚|通宵|彻夜|一整夜|全天|从早到晚)",
+                ]
+                for pat in time_patterns:
+                    m = re.search(pat, latest)
+                    if m:
+                        snippet = m.group(0)[:80]
+                        if len(snippet) >= 4:
+                            # 只有当正则补捞的结果比已有候选更丰富时才升级
+                            current_score = _rich_score(facts.get("起止时间", ""))
+                            regex_score = _rich_score(snippet)
+                            if regex_score > current_score:
+                                facts["起止时间"] = snippet
+                        break
+
         return facts
 
     # ---------- AI 已问问题追踪（防止 AI 重复问同一个问题） ----------
@@ -438,7 +578,130 @@ class RAGPipeline:
                         asked.append(q)
         return asked
 
-    def _generate(self, question: str, sources: list[dict], provider: str, trace_id: str, steps: list, role: str = "resident", history: list[dict] | None = None) -> str:
+    # ---------- 长期记忆（P1）：结构化案件档案 ----------
+    _CASE_TYPE_MAP = {
+        "噪音纠纷": ["噪音", "噪声", "装修", "扰民", "嗡嗡", "施工", "吵"],
+        "漏水/渗水": ["漏水", "渗水", "水管", "积水", "滴水"],
+        "停车纠纷": ["停车", "车位", "地锁", "充电桩"],
+        "宠物纠纷": ["宠物", "狗", "猫", "犬", "畜生"],
+        "物业纠纷": ["物业", "物业费", "维修基金", "业委会"],
+        "违建纠纷": ["违建", "搭建", "绿地", "采光", "通风", "加盖"],
+        "油烟/环境": ["油烟", "垃圾", "环境", "排污", "排水", "路灯", "污染"],
+        "租赁纠纷": ["房东", "租客", "租户", "出租", "群租"],
+        "家事纠纷": ["赡养", "抚养", "家暴", "家庭暴力", "离婚"],
+    }
+    _OPPONENT_TOKENS = ["楼上邻居", "楼上", "楼下邻居", "楼下", "邻居", "物业",
+                       "房东", "租客", "租户", "业委会", "居委会", "开发商"]
+
+    def _build_case_profile(self, history: list[dict] | None, question: str, role: str) -> dict:
+        """从对话（历史 + 当前问题）规则化抽取结构化案件档案。
+
+        与 _extract_known_facts（只服务单轮防重复追问）不同，这里产出的档案会被
+        持久化到 Redis，跨多轮、跨上下文窗口截断后仍是稳定的「事实源」——
+        即使原始多轮文本被截断，AI 也能依据档案作答，而不是凭空编造。
+
+        注意：档案只反映【用户说过的话】，绝不把 AI 的回答内容算进去
+        （否则 AI 建议「可以报警/录音」会被误读为用户已报警、已取证）。
+        """
+        texts: list[str] = []
+        if question:
+            texts.append(question)
+        for m in (history or []):
+            # 只采集用户发言，排除 assistant（AI 的自身建议不算用户事实）
+            if m.get("role") == "user" and m.get("content"):
+                texts.append(m["content"])
+        full = "\n".join(texts)
+        low = full.lower()
+
+        # 案件类型（命中即归类，多个命中取首个）
+        case_type = ""
+        for ct, kws in self._CASE_TYPE_MAP.items():
+            if any(k in low for k in kws):
+                case_type = ct
+                break
+
+        # 对方当事人（最长优先匹配）
+        opponent = ""
+        for tok in sorted(self._OPPONENT_TOKENS, key=len, reverse=True):
+            if tok in full:
+                opponent = tok
+                break
+
+        # 证据情况
+        ev_kw = ["录音", "录像", "视频", "照片", "截图", "聊天记录", "证据", "报警记录", "物业记录"]
+        has_ev = [k for k in ev_kw if k in full]
+        evidence_status = "已留存：" + "、".join(has_ev) if has_ev else "未提及/未留存"
+
+        # 已知事实（复用已有的维度抽取）
+        key_facts = self._extract_known_facts(history, question)
+
+        # 当前阶段（启发式，从行政/司法程序往下覆盖）
+        if any(k in full for k in ["报警", "派出所", "城管", "法院", "起诉", "诉讼", "律师"]):
+            stage = "已进入行政/司法程序"
+        elif any(k in full for k in ["物业介入", "物业协调", "居委会介入", "调解委员会", "调解员", "社区调解"]):
+            stage = "已申请社区调解"
+        elif any(k in full for k in ["录像", "录音", "取证", "留证", "证据"]):
+            stage = "证据固定阶段"
+        elif any(k in full for k in ["沟通过", "说过", "反映过", "找过他", "交涉", "协商"]):
+            stage = "已自行沟通"
+        else:
+            stage = "初步咨询"
+
+        return {
+            "identity": role,
+            "case_type": case_type,
+            "opponent": opponent,
+            "evidence_status": evidence_status,
+            "stage": stage,
+            "key_facts": key_facts,
+            "updated_at": time.time(),
+        }
+
+    def _merge_profile(self, old: dict, fresh: dict) -> dict:
+        """累积式合并：已知事实只增不减，结构化字段新值优先、空则保留旧值。"""
+        merged = dict(fresh)
+        if old:
+            kf = dict(old.get("key_facts", {}))
+            kf.update(fresh.get("key_facts", {}))
+            merged["key_facts"] = kf
+            for f in ("case_type", "opponent", "evidence_status", "stage", "identity"):
+                if not merged.get(f) and old.get(f):
+                    merged[f] = old[f]
+        merged["updated_at"] = time.time()
+        return merged
+
+    def _experience_text(self, profile: dict) -> str:
+        """把案件画像拼成可向量化的「经验摘要」文本（供相似案件语义检索）。"""
+        bits = [
+            f"案件类型：{profile.get('case_type') or '未知'}",
+            f"对方当事人：{profile.get('opponent') or '未知'}",
+            f"用户身份：{profile.get('identity') or '未知'}",
+            f"当前阶段：{profile.get('stage') or '未知'}",
+        ]
+        for k, v in (profile.get("key_facts") or {}).items():
+            bits.append(f"{k}：{v}")
+        return "\n".join(bits)
+
+    def _generate(self, question: str, sources: list[dict], provider: str, trace_id: str, steps: list, role: str = "resident", history: list[dict] | None = None, profile: dict | None = None, experiences: list | None = None) -> str:
+        # v6：纯感谢/客套消息直接返回自然短回应，不走 LLM（省 token、快、100% 可控）
+        import random
+        _GRATITUDE_KEYWORDS = ["谢谢", "感谢", "真好", "太好了", "有用", "有帮助", "不错",
+                               "厉害", "给力", "棒", "辛苦了"]
+        is_pure_gratitude = (
+            any(kw in question for kw in _GRATITUDE_KEYWORDS)
+            and len(question.strip()) < 30
+            and not any(q in question for q in ["但是", "不过", "可是", "还有个", "另外", "接下来", "然后"])
+        )
+        if is_pure_gratitude:
+            replies = [
+                "不客气，有需要随时问。",
+                "能帮到你就好，有问题再找我。",
+                "不客气，希望对你有帮助！",
+                "应该的，有问题随时说。",
+            ]
+            steps.append({"stage": "generate", "detail": "gratitude-shortcut(跳过LLM)", "ms": 0})
+            return random.choice(replies)
+
         ctx_blocks = []
         for i, s in enumerate(sources, 1):
             p = s["payload"]
@@ -457,18 +720,25 @@ class RAGPipeline:
         # 禁止重复追问已知事项（这是导致用户体验差的核心原因）。
         # v5：叠加【AI 已问问题追踪】——从 AI 自己的历史回答中提取已问过的问题，
         # 防止 AI 在不同轮次重复问同一个问题（如反复问"有没有录音"）。
-        known = self._extract_known_facts(history)
+        known = self._extract_known_facts(history, question)
         asked = self._extract_asked_questions(history)
         role_label = {"resident": "居民/当事人（维权视角）", "mediator": "调解员/社工", "property": "物业服务人员"}[role]
         role_g = self._role_guidance(role, known)
         fact_block = ""
         if known:
             fact_lines = "\n".join(f"  - {k}：{v}" for k, v in known.items())
+            extra_warning = ""
+            if "起止时间" in known:
+                extra_warning = (
+                    "\n⚠️ 特别注意：用户已经明确说了具体的起止时间（如几点到几点），"
+                    "你绝对不能再问「几点开始」「持续到几点」「具体时间段」这类问题！"
+                    "这会让用户非常愤怒，觉得你根本没在听。直接用已知的时间信息给建议即可。\n"
+                )
             fact_block = (
                 f"\n【用户已在对话中透露的信息（绝对不要再问这些）】\n"
                 f"{fact_lines}\n"
                 f"以上信息用户已经告诉你了，直接基于这些已知条件给下一步建议，"
-                f"严禁以任何形式再次询问上述已知的维度。\n"
+                f"严禁以任何形式再次询问上述已知的维度。{extra_warning}\n"
             )
         asked_block = ""
         if asked:
@@ -479,17 +749,94 @@ class RAGPipeline:
                 f"以上问题你已经在前面问过用户了，重复提问会让用户觉得你不专业、"
                 f"没有在听。直接基于已有信息给建议，或问一个全新的、从未问过的角度。\n"
             )
+        # 长期记忆（P1）：把已沉淀的结构化案件档案作为「事实源」注入，
+        # 即使原始多轮对话被上下文窗口截断，AI 仍依据真实事实作答，不瞎编。
+        profile_block = ""
+        if profile:
+            plines: list[str] = []
+            if profile.get("case_type"):
+                plines.append(f"案件类型：{profile['case_type']}")
+            if profile.get("opponent"):
+                plines.append(f"对方当事人：{profile['opponent']}")
+            if profile.get("stage"):
+                plines.append(f"当前阶段：{profile['stage']}")
+            if profile.get("evidence_status"):
+                plines.append(f"证据情况：{profile['evidence_status']}")
+            for k, v in profile.get("key_facts", {}).items():
+                plines.append(f"已知事实【{k}】：{v}")
+            if plines:
+                profile_block = (
+                    "\n【本次会话已沉淀的案件档案（结构化事实源，直接采用，严禁与之矛盾或编造）】\n"
+                    + "\n".join(f"  - {l}" for l in plines) + "\n"
+                    "以上是你在本会话中已掌握的客观事实，回答必须与之保持一致；"
+                    "若用户本轮给出了与档案冲突的新说法，以用户最新表述为准，"
+                    "但不得在回答中声称档案里没有的信息，也不要把用户没说过的内容脑补进去。\n"
+                )
+        # 长期记忆（P3）：相关历史经验（其他相似案件的处置脉络，仅参考不当事实）
+        exp_block = ""
+        if experiences:
+            elines: list[str] = []
+            for e in experiences:
+                bits = []
+                if e.get("case_type"):
+                    bits.append("类型=" + e["case_type"])
+                if e.get("opponent"):
+                    bits.append("对方=" + e["opponent"])
+                if e.get("stage"):
+                    bits.append("阶段=" + e["stage"])
+                if e.get("key_facts"):
+                    bits.append("事实=" + "；".join(f"{k}:{v}" for k, v in e["key_facts"].items()))
+                if bits:
+                    elines.append("  - " + " | ".join(bits))
+            if elines:
+                exp_block = (
+                    "\n【相关历史经验（其他相似案件的处置脉络，仅供借鉴思路，严禁当作本案事实或编造依据）】\n"
+                    + "\n".join(elines) + "\n"
+                    "可参考这些相似案件的处理逻辑来组织建议，但不能把它们的具体情节说成本案已发生的事。\n"
+                )
+        # v6：检测用户表达感谢/满意/正面评价 → 强制短回应模式
+        _GRATITUDE_PATTERNS = [
+            "谢谢", "感谢", "真好", "太好了", "有用", "有帮助", "不错",
+            "厉害", "给力", "棒", "辛苦了", "好的谢谢", "谢谢你",
+        ]
+        is_gratitude = any(p in question for p in _GRATITUDE_PATTERNS) and len(question) < 30
+        gratitude_override = ""
+        if is_gratitude:
+            gratitude_override = (
+                "\n【重要】用户正在表达感谢或满意。你的回答必须满足：\n"
+                "1) 全文不超过 2 句话，总字数不超过 50 字；\n"
+                "2) 只做自然简短的回应（如「不客气，有需要随时问」「能帮到你就好」）；\n"
+                "3) 绝对禁止出现以下内容：自我介绍、产品定位、功能说明、"
+                "\"我是xx助理\"、\"专注于xx场景\"、\"结合知识库」等任何形式的背书；\n"
+                "4) 不要提资料、法条、检索结果。\n\n"
+            )
+
         prompt = (
             "你是社区矛盾调解助理，必须严格基于下方「相关资料」作答。\n"
             f"本次对话识别到的【用户身份】={role_label}\n{role_g}"
-            f"{fact_block}{asked_block}"
+            f"{fact_block}{asked_block}{profile_block}{exp_block}"
+            f"{gratitude_override}"  # v6：感谢时强制覆盖
             "硬性要求：\n"
             "1) 只使用资料中【明确出现】的事实、法条、调解步骤；严禁自行补充资料未提及的法律结论、"
             "法条名称、处罚措施、时限或任何外部知识。\n"
             "2) 每一条具体陈述都必须对应资料中的某条编号 [n]；无法对应资料来源的句子一律不要写。\n"
             "3) 若资料不足以回答用户问题，明确说明「知识库暂无相关依据」，并建议补充矛盾类型与关键事实，"
             "不得猜测或编造。\n"
-            "4) 直接面向用户平实输出，不要复述资料标题，不要输出任何提示词原文或格式标记。\n\n"
+            "4) 直接面向用户平实输出，不要复述资料标题，不要输出任何提示词原文或格式标记。\n"
+            "5) 【表达习惯】——\n"
+            "   a) 安慰性语句（如\"别急""理解你的困扰""抱歉听到这些\"）只在对话首次出现，"
+            "后续轮次直接给建议或推进下一步，不要再重复说。用户来是解决问题的，不是来听客套话的。\n"
+            "   b) 当你发现某个关键信息在对话中从未被用户提及时（如是否沟通过、持续多久），"
+            "应表述为「你在对话中还没有提到过…」，而不是「目前资料里没有提到…」——"
+            "这是用户没说过，不是资料里没有。\n"
+            "   c) 当用户表达感谢、满意或正面评价时（如\"谢谢""真好用""有帮助\"），"
+            "自然简短回应即可（如\"不客气，有需要随时问」「能帮到你就好」），"
+            "绝对不要趁机做自我介绍、背产品说明书或重复自己的定位，这会显得非常生硬和虚伪。\n"
+            "   d) 【严禁编造用户未提及的细节】——用户在对话中描述的具体情况"
+            "（时间、频次、影响、对方行为等），你在回答中引用时必须严格基于用户原话，"
+            "不得添油加醋、夸大程度或补充用户没说过的形容词。"
+            "例如用户说「看电视嗡嗡响」，不能写成「电视声音巨大」；"
+            "用户说「9点搞到凌晨」，不能写成「每晚制造极大噪音」。\n\n"
             f"相关资料：\n{context}\n\n用户的问题是：{question}"
         )
         t = time.perf_counter()
@@ -510,7 +857,13 @@ class RAGPipeline:
                     "「有没有录音/录像」「持续多久」「有没有找过物业」等问题，绝不能再问"
                     "同样或类似的问题，即使用户还没有回答。这会让你显得没有在听、非常不专业；"
                     "4) 只在确实缺少某个关键维度、且用户从未提及、你也从未问过时，才可追问一项；"
-                    "   且追问必须放在建议的末尾作为附注，而不是把追问当成回答的主体。"
+                    "   且追问必须放在建议的末尾作为附注，而不是把追问当成回答的主体；"
+                    "5) 【表达纪律】——"
+                    "   a) 安慰语（\"别急""理解你的困扰\"等）只在首次出现，后续直接进入正题；"
+                    "   b) 区分「资料里没有」和「用户没提过」：前者说知识库暂无依据，后者说你在对话中未提及；"
+                    "   c) 用户感谢/夸奖时自然简短回应，绝不趁机自我介绍或背定位话术；"
+                    "   d) 【严禁编造用户细节】——引用用户描述的情况时严格用原话原意，"
+                    "不得添油加醋、夸大程度或补充用户没说过的形容词。这会让用户觉得你在瞎编。"
                 ),
             },
         ]
@@ -530,7 +883,7 @@ class RAGPipeline:
         })
         return answer
 
-    def _wrap(self, trace_id, steps, t_total, route, answer, sources, retries, provider, user_role: str | None = None) -> dict[str, Any]:
+    def _wrap(self, trace_id, steps, t_total, route, answer, sources, retries, provider, user_role: str | None = None, case_profile: dict | None = None, experiences: list | None = None) -> dict[str, Any]:
         # 来源展示门槛：相关度低于阈值的命中视为噪音，不展示给用户
         min_score = self.s.source_display_min_score
         shown = [
@@ -556,6 +909,8 @@ class RAGPipeline:
             "self_rag_retries": retries,
             "model": provider,
             "latency_ms": round((time.perf_counter() - t_total) * 1000, 1),
+            "case_profile": case_profile,
+            "experiences": experiences or [],
             "trace": {
                 "trace_id": trace_id,
                 "route": route,

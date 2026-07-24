@@ -8,6 +8,25 @@ const models = ref([])
 const currentModel = ref('deepseek')
 const chatArea = ref(null)
 
+// 短期记忆：会话列表与当前会话 id（后端 Redis/内存存储，刷新/新标签不丢）
+const sessionId = ref('')
+const sessions = ref([])
+
+// 长期记忆：当前会话沉淀的结构化案件档案（可视化给用户看）
+const caseProfile = ref(null)
+const profileOpen = ref(false)
+function updateProfile(p) {
+  caseProfile.value = (p && Object.keys(p).length) ? p : caseProfile.value
+}
+async function loadProfile(sid) {
+  if (!sid) { caseProfile.value = null; return }
+  try {
+    const r = await fetch('/api/sessions/' + encodeURIComponent(sid) + '/profile')
+    const d = await r.json()
+    caseProfile.value = (d.profile && Object.keys(d.profile).length) ? d.profile : null
+  } catch (e) { caseProfile.value = null }
+}
+
 const examples = [
   '楼上漏水导致我家天花板发霉怎么办',
   '邻居私装地锁占用公共车位，其他业主如何处理？',
@@ -23,17 +42,14 @@ onMounted(async () => {
   } catch (e) {
     console.warn('获取模型列表失败', e)
   }
+  // 加载历史会话列表
+  await refreshSessions()
 })
 
 async function send(text) {
   const question = (text ?? input.value).trim()
   if (!question || loading.value) return
   input.value = ''
-  // 多轮对话：截取"提交本轮问题之前"的历史（成对 user/bot），供后端承接上下文
-  const history = messages
-    .filter(m => (m.role === 'user' || m.role === 'bot') && !m.loading && m.content)
-    .slice(-8)
-    .map(m => ({ role: m.role, content: m.content }))
   messages.push({ role: 'user', content: question })
   messages.push({ role: 'bot', content: '', loading: true })
   loading.value = true
@@ -41,10 +57,12 @@ async function send(text) {
   scrollToBottom()
 
   try {
+    // 短期记忆：会话历史由后端按 session_id 拉取，前端不再拼接 history
+    const sid = await ensureSession()
     const resp = await fetch('/api/chat', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ question, provider: currentModel.value, history })
+      body: JSON.stringify({ question, provider: currentModel.value, session_id: sid })
     })
     const data = await resp.json()
     const last = messages[messages.length - 1]
@@ -57,6 +75,12 @@ async function send(text) {
     last.latency = data.latency_ms
     last.traceId = data.trace_id
     last.trace = data.trace || null
+    last.profile = data.case_profile || null
+    last.experiences = data.experiences || []
+    // 同步 session_id + 刷新侧栏标题 + 案件档案
+    if (data.session_id) sessionId.value = data.session_id
+    updateProfile(data.case_profile)
+    refreshSessions()
   } catch (e) {
     const last = messages[messages.length - 1]
     last.loading = false
@@ -72,14 +96,80 @@ function scrollToBottom() {
   if (chatArea.value) chatArea.value.scrollTop = chatArea.value.scrollHeight
 }
 
-// 新建会话：清空当前对话，开启一段全新上下文（历史随之重置）
-function newChat() {
+// ---------- 会话管理（短期记忆） ----------
+function fmtTime(ts) {
+  if (!ts) return ''
+  const d = new Date(ts * 1000)
+  const pad = (n) => String(n).padStart(2, '0')
+  return `${pad(d.getMonth() + 1)}-${pad(d.getDate())} ${pad(d.getHours())}:${pad(d.getMinutes())}`
+}
+
+async function refreshSessions() {
+  try {
+    const r = await fetch('/api/sessions')
+    const d = await r.json()
+    sessions.value = d.sessions || []
+  } catch (e) { console.warn('获取会话列表失败', e) }
+}
+
+async function ensureSession() {
+  if (sessionId.value) return sessionId.value
+  // 首次发消息自动建会话
+  const r = await fetch('/api/sessions', { method: 'POST' })
+  const d = await r.json()
+  sessionId.value = d.session_id
+  await refreshSessions()
+  return sessionId.value
+}
+
+// 新建会话：清屏并新建一段会话上下文（后端持久化）
+async function newChat() {
   if (loading.value) return
   messages.splice(0, messages.length)
   input.value = ''
+  caseProfile.value = null
+  try {
+    const r = await fetch('/api/sessions', { method: 'POST' })
+    const d = await r.json()
+    sessionId.value = d.session_id
+    await refreshSessions()
+  } catch (e) { console.warn('新建会话失败', e); sessionId.value = '' }
+}
+
+// 打开历史会话：加载完整消息到主区域
+async function loadSession(id) {
+  if (loading.value) return
+  try {
+    const r = await fetch('/api/sessions/' + encodeURIComponent(id))
+    const d = await r.json()
+    sessionId.value = id
+    messages.splice(0, messages.length)
+    for (const m of (d.messages || [])) {
+      messages.push({
+        role: m.role === 'assistant' ? 'bot' : 'user',
+        content: m.content,
+      })
+    }
+    await loadProfile(id)
+  } catch (e) { console.warn('加载会话失败', e) }
+}
+
+// 删除会话
+async function deleteSession(id) {
+  if (!confirm('确定删除该会话？此操作不可恢复。')) return
+  try {
+    await fetch('/api/sessions/' + encodeURIComponent(id), { method: 'DELETE' })
+    if (sessionId.value === id) {
+      sessionId.value = ''
+      messages.splice(0, messages.length)
+      caseProfile.value = null
+    }
+    await refreshSessions()
+  } catch (e) { console.warn('删除会话失败', e) }
 }
 
 const routeLabel = { retrieve: '检索回答', direct: '直接回答', clarify: '需澄清', out_of_domain: '超出范围' }
+const roleLabel2 = { resident: '居民/当事人', mediator: '调解员/社工', property: '物业服务人员' }
 
 // 与后端 source_display_min_score 对齐：低于此相关度的命中视为噪音，不渲染来源卡片
 const SOURCE_MIN_SCORE = 0.3
@@ -290,21 +380,68 @@ function kbGoPage(delta) {
 
 <template>
   <div class="app">
-    <header class="app-header">
-      <h1>🤝 社区矛盾调解 RAG 助手 <span class="badge">Agentic RAG</span></h1>
-      <div class="header-right">
-        <nav class="tabs">
-          <button :class="['tab', { active: tab === 'chat' }]" @click="switchTab('chat')">对话</button>
-          <button :class="['tab', { active: tab === 'kb' }]" @click="switchTab('kb')">知识库</button>
-        </nav>
-        <select class="model-select" v-model="currentModel" v-if="tab === 'chat'">
-          <option v-for="m in models" :key="m.provider" :value="m.provider">
-            {{ m.label }}（{{ m.model }}）{{ m.available ? '' : '· 未配置key' }}
-          </option>
-        </select>
-        <button class="new-chat" v-if="tab === 'chat'" :disabled="!messages.length || loading" @click="newChat">＋ 新建会话</button>
+    <!-- 左侧会话栏：历史会话列表（短期记忆） -->
+    <aside class="sidebar" v-if="tab === 'chat'">
+      <div class="sidebar-head">
+        <button class="new-chat full" :disabled="loading" @click="newChat">＋ 新建会话</button>
       </div>
-    </header>
+      <div class="session-list">
+        <div
+          v-for="s in sessions"
+          :key="s.id"
+          :class="['session-item', { active: s.id === sessionId }]"
+          @click="loadSession(s.id)"
+        >
+          <div class="session-main">
+            <div class="session-title">{{ s.title || '新会话' }}</div>
+            <div class="session-meta">{{ fmtTime(s.updated_at) }}</div>
+          </div>
+          <button class="session-del" @click.stop="deleteSession(s.id)" title="删除会话">✕</button>
+        </div>
+        <div v-if="!sessions.length" class="session-empty">暂无历史会话，点上方新建</div>
+      </div>
+    </aside>
+
+    <div class="main">
+      <header class="app-header">
+        <h1>🤝 社区矛盾调解 RAG 助手 <span class="badge">Agentic RAG</span></h1>
+        <div class="header-right">
+          <nav class="tabs">
+            <button :class="['tab', { active: tab === 'chat' }]" @click="switchTab('chat')">对话</button>
+            <button :class="['tab', { active: tab === 'kb' }]" @click="switchTab('kb')">知识库</button>
+          </nav>
+          <select class="model-select" v-model="currentModel" v-if="tab === 'chat'">
+            <option v-for="m in models" :key="m.provider" :value="m.provider">
+              {{ m.label }}（{{ m.model }}）{{ m.available ? '' : '· 未配置key' }}
+            </option>
+          </select>
+        </div>
+      </header>
+
+      <!-- 长期记忆可视化：本次会话沉淀的结构化案件档案 -->
+      <div v-if="tab === 'chat' && caseProfile" class="profile-bar">
+        <button class="profile-toggle" @click="profileOpen = !profileOpen">
+          📋 案件档案 <span class="profile-caret">{{ profileOpen ? '▾' : '▸' }}</span>
+        </button>
+        <div class="profile-chips" v-if="!profileOpen">
+          <span class="pc" v-if="caseProfile.case_type">{{ caseProfile.case_type }}</span>
+          <span class="pc" v-if="caseProfile.opponent">{{ caseProfile.opponent }}</span>
+          <span class="pc" v-if="caseProfile.stage">{{ caseProfile.stage }}</span>
+        </div>
+        <div class="profile-detail" v-if="profileOpen">
+          <div class="pf-row" v-if="caseProfile.case_type"><b>案件类型</b><span>{{ caseProfile.case_type }}</span></div>
+          <div class="pf-row" v-if="caseProfile.opponent"><b>对方当事人</b><span>{{ caseProfile.opponent }}</span></div>
+          <div class="pf-row" v-if="caseProfile.identity"><b>用户身份</b><span>{{ roleLabel2[caseProfile.identity] || caseProfile.identity }}</span></div>
+          <div class="pf-row" v-if="caseProfile.stage"><b>当前阶段</b><span>{{ caseProfile.stage }}</span></div>
+          <div class="pf-row" v-if="caseProfile.evidence_status"><b>证据情况</b><span>{{ caseProfile.evidence_status }}</span></div>
+          <div class="pf-row" v-if="caseProfile.key_facts && Object.keys(caseProfile.key_facts).length">
+            <b>已知事实</b>
+            <span class="kf-list">
+              <span class="kf" v-for="(v, k) in caseProfile.key_facts" :key="k">{{ k }}：{{ v }}</span>
+            </span>
+          </div>
+        </div>
+      </div>
 
     <div v-if="tab === 'chat'" class="chat-area" ref="chatArea">
       <div v-if="messages.length === 0" class="empty">
@@ -324,6 +461,10 @@ function kbGoPage(delta) {
           </div>
           <div v-if="m.loading" class="typing">正在检索知识库并生成…</div>
           <div v-else>{{ m.content }}</div>
+
+          <div v-if="m.experiences && m.experiences.length" class="exp-note">
+            💡 参考了 {{ m.experiences.length }} 个相似历史案件的处理思路
+          </div>
 
           <div v-if="m.sources && m.sources.length" class="sources">
             <div class="source-card" v-for="s in m.sources" :key="s.id">
@@ -447,6 +588,7 @@ function kbGoPage(delta) {
           </div>
         </div>
       </div>
+    </div>
     </div>
   </div>
 </template>
