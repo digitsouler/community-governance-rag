@@ -3,13 +3,14 @@
 接口：
   GET  /api/health           健康检查 + 知识库条数
   GET  /api/models           可用模型列表
-  POST /api/chat             矛盾调解问答 { question, provider? }
+  POST /api/chat             矛盾调解问答 { question, provider?, history?:[{role,content}] }
 
   GET  /api/kb/stats         知识库统计（总数/已发布/草稿/分块/类别分布）
   GET  /api/kb/docs          文档列表（支持 ?status=&category=&page=&size=）
   POST /api/kb/upload        上传文档（base64 JSON）-> 草稿
   POST /api/kb/import-directory  批量导入目录（files:[{filename,content_base64}]）-> 仅存为草稿
   POST /api/kb/publish-selected  发布选中的草稿（{ids:[...]}，批量嵌入，性能好）
+  POST /api/kb/delete-selected   批量删除选中（本地文件+向量库一起删）{ids:[...]}
   POST /api/kb/publish-all        一键发布全部草稿（批量嵌入，性能好）
   GET  /api/kb/{id}/content      读取文档正文（详情预览用，过大文件标记 too_large）
   POST /api/kb/{id}/publish  发布文档（嵌入+入向量库+重建BM25）
@@ -206,6 +207,17 @@ class Handler(BaseHTTPRequestHandler):
             self._send(200, {"status": "ok", **res})
             return
 
+        # 知识库：批量删除选中（本地文件 + 向量库一起删）
+        if path == "/api/kb/delete-selected":
+            ids = data.get("ids") or []
+            if not isinstance(ids, list) or not ids:
+                self._send(400, {"error": "ids 必填（数组：文档 id 列表）"})
+                return
+            ids = [str(i) for i in ids]
+            res = _kb().delete_many(ids)
+            self._send(200, {"status": "ok", **res})
+            return
+
         # 知识库：发布 / 下架
         doc_action = self._kb_doc_action(path)
         if doc_action:
@@ -222,6 +234,11 @@ class Handler(BaseHTTPRequestHandler):
         if path == "/api/chat":
             question = (data.get("question") or "").strip()
             provider = data.get("provider")
+            # 多轮对话：接收前端传来的历史（[{role, content}]），容错限制条数
+            history = data.get("history")
+            if not isinstance(history, list):
+                history = []
+            history = history[-12:]  # 兜底截断，pipeline 内部还会再规整
             if not question:
                 self._send(400, {"error": "question 不能为空"})
                 return
@@ -229,9 +246,9 @@ class Handler(BaseHTTPRequestHandler):
                 provider = None
             req_id = uuid.uuid4().hex[:12]
             t0 = time.perf_counter()
-            log.info("[%s] POST /api/chat | provider=%s | q=%r", req_id, provider or settings.default_llm, question[:60])
+            log.info("[%s] POST /api/chat | provider=%s | 历史=%d | q=%r", req_id, provider or settings.default_llm, len(history), question[:60])
             try:
-                result = pipeline.query(question, provider)
+                result = pipeline.query(question, provider, history=history)
                 result["trace_id"] = result.get("trace_id", req_id)
                 dt = (time.perf_counter() - t0) * 1000
                 log.info("[%s] 响应 | code=200 | route=%s | 耗时=%.0fms", req_id, result["route"], dt)

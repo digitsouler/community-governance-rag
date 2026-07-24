@@ -25,6 +25,8 @@ backend/eval_results/
 backend/data/ingested.jsonl
 # 知识库 manifest（首次启动由 KBManager.ensure 从种子+corpus/raw 重建，勿提交）
 backend/data/kb_manifest.jsonl
+# 知识库运行时索引（启动时由 KBManager 扫描文件自动重建，勿提交）
+backend/app/data/kb_index.json
 # 用户上传文档落盘目录（运行时产生，勿提交）
 backend/corpus/uploads/
 

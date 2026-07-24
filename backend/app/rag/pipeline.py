@@ -82,7 +82,7 @@ class RAGPipeline:
         except Exception as e:  # noqa: BLE001
             log.warning("BM25 重建失败：%s", e)
             self.bm25._built = False
-    def _supervise(self, question: str) -> str:
+    def _supervise(self, question: str, has_history: bool = False) -> str:
         q = question.strip()
         ql = q.lower()
         greet = ["你好", "您好", "hi", "hello", "在吗", "谢谢", "感谢"]
@@ -90,8 +90,9 @@ class RAGPipeline:
             return "direct"
         if any(k in q for k in ["你是谁", "你是什么", "你能干", "你会", "介绍下你", "怎么用"]):
             return "direct"
+        # 有历史时，短句多为对上一轮追问的回答（如"好几天了""是的"），继续走检索而非再次澄清
         if len(q) < 4:
-            return "clarify"
+            return "retrieve" if has_history else "clarify"
         # 领域判断：命中治理关键词 → 域内（走检索）；
         # 仅命中离域关键词、且无治理关键词 → 超出服务范围（不检索）
         hit_governance = any(k in ql for k in GOVERNANCE_KEYWORDS)
@@ -124,6 +125,42 @@ class RAGPipeline:
             "其他业主该如何处理？」"
         )
 
+    # ---------- 多轮对话辅助 ----------
+    def _normalize_history(self, history: list[dict] | None) -> list[dict]:
+        """规整前端传来的历史：只保留 user/assistant 的非空文本，取最近 MAX_HISTORY 条。
+
+        兼容前端的 role='bot'（统一转 'assistant'）；过滤 loading/空串；
+        末尾若恰好等于本轮问题（前端可能已 push）则不在此处理，由调用方保证不重复。
+        """
+        MAX_HISTORY = 8  # 最近 8 条 ≈ 4 轮，足够承接语境又不撑爆上下文
+        if not history or not isinstance(history, list):
+            return []
+        norm = []
+        for m in history:
+            if not isinstance(m, dict):
+                continue
+            role = m.get("role")
+            content = (m.get("content") or "").strip()
+            if not content or role not in ("user", "bot", "assistant"):
+                continue
+            norm.append({"role": "user" if role == "user" else "assistant", "content": content})
+        return norm[-MAX_HISTORY:]
+
+    def _contextual_query(self, question: str, history: list[dict]) -> str:
+        """把历史里最近的用户话题词并进当前问题，形成用于检索的合并查询。
+
+        追答常是碎片（"好几天了 找过他没用"），本身缺少主题词（"噪音"），
+        直接检索会跑题。这里取最近最多 2 条历史【用户】发言拼在当前问题前，
+        让稠密/稀疏检索都能锚定到原始话题。仅用于检索，不改变展示给用户的问题。
+        """
+        if not history:
+            return question
+        prev_user = [m["content"] for m in history if m["role"] == "user"][-2:]
+        if not prev_user:
+            return question
+        merged = " ".join(prev_user) + " " + question
+        return merged.strip()
+
     # ---------- Retrieval + Self-RAG ----------
     def _reformulate(self, query: str) -> str:
         q = query
@@ -132,11 +169,18 @@ class RAGPipeline:
         return q.strip() or query
 
     # ---------- 对外接口 ----------
-    def query(self, question: str, provider: ProviderName | None = None) -> dict[str, Any]:
+    def query(
+        self,
+        question: str,
+        provider: ProviderName | None = None,
+        history: list[dict] | None = None,
+    ) -> dict[str, Any]:
         trace_id = uuid.uuid4().hex[:12]
         provider = provider or self.s.default_llm
         steps: list[dict[str, Any]] = []
         t_total = time.perf_counter()
+        # 多轮对话：规整历史（只保留最近若干轮 user/assistant 文本）
+        history = self._normalize_history(history)
 
         def mark(stage: str, detail: str = "", start: float | None = None):
             ms = (time.perf_counter() - start) * 1000 if start else None
@@ -144,11 +188,11 @@ class RAGPipeline:
 
         log.info("[%s] 新请求 | provider=%s | q=%r", trace_id, provider, question[:60])
 
-        # Supervisor 路由
+        # Supervisor 路由（有历史时，短追答不再误判为 clarify）
         t = time.perf_counter()
-        route = self._supervise(question)
+        route = self._supervise(question, has_history=bool(history))
         mark("supervise", f"route={route}", t)
-        log.info("[%s] 路由判定=%s", trace_id, route)
+        log.info("[%s] 路由判定=%s | 历史轮数=%d", trace_id, route, len(history))
 
         if route == "direct":
             return self._wrap(trace_id, steps, t_total, "direct", self._direct_answer(), [], 0, provider)
@@ -162,7 +206,12 @@ class RAGPipeline:
         # mock 模式下向量为字符哈希、无语义，阈值归零以便演示完整检索链路
         is_mock = self.embedder.use_mock
         thr = 0.0 if is_mock else self.s.relevance_threshold
-        query = question
+        # 上下文合并查询：把历史里的话题词并进当前追答一起检索，
+        # 解决碎片化追答（如"好几天了 找过他没用"）丢失主题导致跑题的问题。
+        query = self._contextual_query(question, history)
+        if query != question:
+            log.info("[%s] 上下文合并检索 | %r -> %r", trace_id, question, query)
+            steps.append({"stage": "context_merge", "detail": f"{question!r} -> {query!r}", "ms": None})
         ranked, best = self._retrieve(query, trace_id, steps)
         retries = 0
         while best < thr and retries < self.s.max_retrieve_retries:
@@ -188,10 +237,10 @@ class RAGPipeline:
             log.warning("[%s] 诚实拒答 | 最佳相关度=%.4f < 阈值=%.4f | 重试=%d", trace_id, best, thr, retries)
             return self._wrap(trace_id, steps, t_total, "retrieve", honest, [], retries, provider)
 
-        # 用户角色感知：决定答案视角（居民/调解员/物业）
-        role = self._infer_role(question)
+        # 用户角色感知：决定答案视角（居民/调解员/物业）——参考历史，避免追答丢失身份
+        role = self._infer_role(question, history)
         mark("infer_role", f"role={role}")
-        answer = self._generate(question, ranked, provider, trace_id, steps, role=role)
+        answer = self._generate(question, ranked, provider, trace_id, steps, role=role, history=history)
         log.info("[%s] 完成 | 路由=retrieve 来源数=%d 重试=%d 角色=%s", trace_id, len(ranked), retries, role)
         return self._wrap(trace_id, steps, t_total, "retrieve", answer, ranked, retries, provider, user_role=role)
 
@@ -235,13 +284,16 @@ class RAGPipeline:
         return ranked, best
 
     # ---------- 用户角色感知（Agent 能力：让答案服从对话对象身份） ----------
-    def _infer_role(self, question: str) -> str:
+    def _infer_role(self, question: str, history: list[dict] | None = None) -> str:
         """从用户措辞推断其身份，用于决定答案视角。
 
         默认 'resident'（居民/当事人/投诉人）——因为我们面对的主要是来维权的居民；
         命中调解/社区工作口吻则判定为 'mediator'；命中物业职责口吻为 'property'。
+        多轮场景下把历史用户话合并判断，避免碎片化追答丢失身份。
         """
         q = question
+        if history:
+            q = " ".join([m["content"] for m in history if m["role"] == "user"]) + " " + question
         if any(k in q for k in [
             "接案", "接到投诉", "受理登记", "如何调解", "怎么调解", "调解流程",
             "组织座谈", "上门走访", "回访", "调处", "社区工作站", "网格员", "网格",
@@ -283,7 +335,7 @@ class RAGPipeline:
             "5) 法条作为支撑标注，用居民能懂的话解释，不要念法条原文唬人。\n"
         )
 
-    def _generate(self, question: str, sources: list[dict], provider: str, trace_id: str, steps: list, role: str = "resident") -> str:
+    def _generate(self, question: str, sources: list[dict], provider: str, trace_id: str, steps: list, role: str = "resident", history: list[dict] | None = None) -> str:
         ctx_blocks = []
         for i, s in enumerate(sources, 1):
             p = s["payload"]
@@ -313,20 +365,25 @@ class RAGPipeline:
             f"相关资料：\n{context}\n\n用户的问题是：{question}"
         )
         t = time.perf_counter()
-        answer = self.llm.chat(
-            messages=[
-                {
-                    "role": "system",
-                    "content": (
-                        "社区矛盾调解助理。你的全部回答必须严格依据用户提供的检索资料，"
-                        "绝不外推或编造资料中不存在的法条与事实；资料不足时如实告知。"
-                        f"本次对话对象身份为：{role_label}，请从该角色视角组织回答。"
-                    ),
-                },
-                {"role": "user", "content": prompt},
-            ],
-            provider=provider,
-        )
+        # 多轮对话：system + 历史对话 + 当前（带检索资料的）问题
+        msgs = [
+            {
+                "role": "system",
+                "content": (
+                    "社区矛盾调解助理。你的全部回答必须严格依据用户提供的检索资料，"
+                    "绝不外推或编造资料中不存在的法条与事实；资料不足时如实告知。"
+                    f"本次对话对象身份为：{role_label}，请从该角色视角组织回答。"
+                    "这是一段【连续对话】：用户的当前发言可能是在回答你上一轮的追问，"
+                    "务必结合上文语境理解，紧扣同一件事继续，切勿跳到无关话题；"
+                    "若用户已补充了此前追问的信息，就不要重复追问，直接给出下一步建议。"
+                ),
+            },
+        ]
+        if history:
+            for m in history:
+                msgs.append({"role": "assistant" if m["role"] in ("bot", "assistant") else "user", "content": m["content"]})
+        msgs.append({"role": "user", "content": prompt})
+        answer = self.llm.chat(messages=msgs, provider=provider)
         # 兜底：清除模型偶发复述的提示词标记（根因已在 prompt 中去除）
         answer = answer.replace("【参考依据】", "")
         answer = re.sub(r"^\s*参考依据[：:].*$", "", answer, flags=re.M)

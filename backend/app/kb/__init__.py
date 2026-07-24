@@ -409,6 +409,28 @@ class KBManager:
         self._save_index()
         return True
 
+    def delete_many(self, doc_ids: list[str]) -> dict:
+        """批量删除：逐个 unpublish（向量库）+ 删本地文件 + 清索引，BM25 只重建一次。"""
+        deleted = 0
+        failed = 0
+        for doc_id in doc_ids:
+            try:
+                ok = self.delete(doc_id)
+                if ok:
+                    deleted += 1
+                else:
+                    failed += 1
+            except Exception as e:
+                log.warning("批量删除跳过 %s：%s", doc_id, e)
+                failed += 1
+        # BM25 在每次 delete 内部已通过 unpublish 触发 _rebuild_bm25，
+        # 但逐次调用效率低；这里统一收尾一次确保一致性
+        try:
+            self._rebuild_bm25()
+        except Exception:
+            pass
+        return {"deleted": deleted, "failed": failed}
+
     # ---------- BM25 同步 ----------
     def _rebuild_bm25(self) -> None:
         try:

@@ -29,6 +29,11 @@ async function send(text) {
   const question = (text ?? input.value).trim()
   if (!question || loading.value) return
   input.value = ''
+  // 多轮对话：截取"提交本轮问题之前"的历史（成对 user/bot），供后端承接上下文
+  const history = messages
+    .filter(m => (m.role === 'user' || m.role === 'bot') && !m.loading && m.content)
+    .slice(-8)
+    .map(m => ({ role: m.role, content: m.content }))
   messages.push({ role: 'user', content: question })
   messages.push({ role: 'bot', content: '', loading: true })
   loading.value = true
@@ -39,7 +44,7 @@ async function send(text) {
     const resp = await fetch('/api/chat', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ question, provider: currentModel.value })
+      body: JSON.stringify({ question, provider: currentModel.value, history })
     })
     const data = await resp.json()
     const last = messages[messages.length - 1]
@@ -67,6 +72,13 @@ function scrollToBottom() {
   if (chatArea.value) chatArea.value.scrollTop = chatArea.value.scrollHeight
 }
 
+// 新建会话：清空当前对话，开启一段全新上下文（历史随之重置）
+function newChat() {
+  if (loading.value) return
+  messages.splice(0, messages.length)
+  input.value = ''
+}
+
 const routeLabel = { retrieve: '检索回答', direct: '直接回答', clarify: '需澄清', out_of_domain: '超出范围' }
 
 // 与后端 source_display_min_score 对齐：低于此相关度的命中视为噪音，不渲染来源卡片
@@ -86,7 +98,10 @@ const publishingAll = ref(false)
 // 勾选（发布选中草稿）
 const selectedIds = ref([])
 const selectedCount = computed(() => selectedIds.value.length)
-const allDraftsSelected = computed(() => kbStats.draft > 0 && selectedIds.value.length === kbStats.draft)
+// 全选状态：当前页所有项都被选中时显示"取消全选"
+const allPageSelected = computed(() =>
+  kbDocs.items.length > 0 && kbDocs.items.every(d => selectedIds.value.includes(d.id))
+)
 
 async function loadKbStats() {
   try {
@@ -192,14 +207,14 @@ async function doImportDir(e) {
   }
 }
 
-// 全选 / 取消全选草稿（跨分页，直接拉取全部草稿 id）
+// 全选 / 取消全选（选中列表所有行，跨分页拉取全部 id）
 async function toggleSelectAll() {
   if (selectedIds.value.length > 0) { selectedIds.value = []; return }
   try {
-    const r = await fetch('/api/kb/docs?status=draft&size=10000')
+    const r = await fetch('/api/kb/docs?size=10000')
     const d = await r.json()
     selectedIds.value = (d.items || []).map(x => x.id)
-  } catch (e) { console.warn('拉取草稿失败', e) }
+  } catch (e) { console.warn('拉取全量文档失败', e) }
 }
 
 // 发布选中的草稿进向量库
@@ -219,6 +234,27 @@ async function publishSelected() {
     await loadKbStats(); await loadKbDocs()
   } catch (e) { alert('发布失败：' + (e.message || e)) }
   finally { publishingAll.value = false }
+}
+
+// 批量删除选中（本地文件 + 向量库一起删）
+const deleting = ref(false)
+async function deleteSelected() {
+  if (!selectedIds.value.length || deleting.value) return
+  const n = selectedIds.value.length
+  if (!confirm(`确定要删除选中的 ${n} 个文档吗？\n这将同时删除本地文件和向量库数据，不可恢复。`)) return
+  deleting.value = true
+  try {
+    const r = await fetch('/api/kb/delete-selected', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ ids: selectedIds.value })
+    })
+    const d = await r.json()
+    alert(`已删除 ${d.deleted || 0} 个文档（本地文件+向量库已清除）${d.failed ? `，${d.failed} 个失败` : ''}`)
+    selectedIds.value = []
+    await loadKbStats(); await loadKbDocs()
+  } catch (e) { alert('批量删除失败：' + (e.message || e)) }
+  finally { deleting.value = false }
 }
 
 // 详情预览：从后端拉取正文弹窗显示
@@ -266,6 +302,7 @@ function kbGoPage(delta) {
             {{ m.label }}（{{ m.model }}）{{ m.available ? '' : '· 未配置key' }}
           </option>
         </select>
+        <button class="new-chat" v-if="tab === 'chat'" :disabled="!messages.length || loading" @click="newChat">＋ 新建会话</button>
       </div>
     </header>
 
@@ -343,20 +380,23 @@ function kbGoPage(delta) {
           {{ importing ? '导入中…' : '导入整个目录（存为草稿）' }}
           <input ref="dirInput" type="file" webkitdirectory directory multiple @change="doImportDir" :disabled="importing" hidden />
         </label>
-        <button class="upload-btn ghost" :disabled="kbStats.draft === 0" @click="toggleSelectAll">
-          {{ allDraftsSelected ? '取消全选' : '全选草稿' }}
+        <button class="upload-btn ghost" :disabled="kbDocs.total === 0" @click="toggleSelectAll">
+          {{ allPageSelected ? '取消全选' : '全选' }}
         </button>
         <button class="upload-btn ghost primary" :disabled="selectedCount === 0 || publishingAll" @click="publishSelected">
           {{ publishingAll ? '发布中…' : `发布选中草稿 (${selectedCount})` }}
         </button>
-        <span class="hint">导入目录先存为草稿；勾选后点「发布选中草稿」才进向量库可检索。</span>
+        <button class="upload-btn ghost danger-outline" :disabled="selectedCount === 0 || deleting" @click="deleteSelected">
+          {{ deleting ? '删除中…' : `批量删除 (${selectedCount})` }}
+        </button>
+        <span class="hint">勾选文档后可批量发布或删除；发布仅对草稿生效，删除同时清除本地文件与向量库。</span>
       </div>
 
       <div v-if="kbLoading" class="kb-loading">加载中…</div>
       <table v-else class="kb-table">
         <thead>
           <tr>
-            <th class="col-check"><input type="checkbox" :checked="allDraftsSelected" @change="toggleSelectAll" title="全选草稿"></th>
+            <th class="col-check"><input type="checkbox" :checked="allPageSelected" @change="toggleSelectAll" title="全选/取消全选"></th>
             <th>标题</th><th>类别</th><th>状态</th><th>分块</th><th>来源</th><th>操作</th>
           </tr>
         </thead>
@@ -496,6 +536,18 @@ function kbGoPage(delta) {
   font-weight: 600;
   box-shadow: 0 1px 2px rgba(0,0,0,.1);
 }
+.new-chat {
+  border: 1px solid #cbd5e1;
+  background: #fff;
+  color: #0f172a;
+  padding: 6px 12px;
+  border-radius: 8px;
+  cursor: pointer;
+  font-size: 13px;
+  white-space: nowrap;
+}
+.new-chat:hover:not(:disabled) { background: #f1f5f9; }
+.new-chat:disabled { opacity: 0.45; cursor: not-allowed; }
 
 /* ---------- 知识库后台 ---------- */
 .kb-area {
@@ -604,6 +656,8 @@ function kbGoPage(delta) {
 
 .upload-btn.primary { background: #16a34a; border-color: #16a34a; color: #fff; }
 .upload-btn.primary:hover:not(:disabled) { background: #15803d; }
+.upload-btn.danger-outline { background: #fff; color: #ef4444; border: 1px solid #ef4444; }
+.upload-btn.danger-outline:hover:not(:disabled) { background: #fef2f2; }
 
 .col-check { width: 38px; text-align: center; }
 .col-check input { width: 16px; height: 16px; cursor: pointer; }
