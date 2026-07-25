@@ -356,3 +356,30 @@ body {
   border: 1px solid rgba(47,109,240,.25); cursor: default;
   white-space: nowrap; max-width: 200px; overflow: hidden; text-overflow: ellipsis;
 }
+
+/* ---------- 全屏角色选择遮罩（未选角色时阻挡一切） ---------- */
+.role-overlay {
+  max-width: 560px;
+  margin: 40px auto 0;
+  padding: 32px 28px 24px;
+  text-align: center;
+}
+.role-overlay h2 {
+  font-size: 22px;
+  color: var(--text);
+  margin-bottom: 4px;
+}
+.role-overlay-sub {
+  font-size: 14px;
+  color: var(--muted);
+  margin-bottom: 24px;
+}
+
+/* 增强版 [N] tooltip（支持多行摘要+法条，更宽更高） */
+.ref-tag:hover::after {
+  max-width: 400px;
+  white-space: pre-wrap;
+  font-size: 11.5px;
+  line-height: 1.55;
+  padding: 10px 14px;
+}

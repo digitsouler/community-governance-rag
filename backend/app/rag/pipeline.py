@@ -16,6 +16,7 @@ import uuid
 from typing import Any
 
 from app.config import ProviderName, Settings, get_settings
+from app.gateway import get_guardrails
 from app.log import get_logger
 from app.profile_store import get_profile_store
 from app.rag.embeddings import EmbeddingClient
@@ -201,7 +202,7 @@ class RAGPipeline:
             ms = (time.perf_counter() - start) * 1000 if start else None
             steps.append({"stage": stage, "detail": detail, "ms": round(ms, 1) if ms is not None else None})
 
-        log.info("[%s] 新请求 | provider=%s | q=%r", trace_id, provider, question[:60])
+        log.info("[%s] 新请求 | provider=%s | q=%r", trace_id, provider, get_guardrails().redact(question)[:60])
 
         # 纯感谢/客套消息短路——在路由之前拦截，不走 LLM（省 token、快、100% 可控）
         _GRATITUDE_KW = ["谢谢", "感谢", "真好", "太好了", "有用", "有帮助",
@@ -257,15 +258,20 @@ class RAGPipeline:
         thr = 0.0 if is_mock else self.s.relevance_threshold
         query = self._contextual_query(question, history)
         if query != question:
-            log.info("[%s] 上下文合并检索 | %r -> %r", trace_id, question, query)
-            steps.append({"stage": "context_merge", "detail": f"{question!r} -> {query!r}", "ms": None})
+            log.info("[%s] 上下文合并检索 | %r -> %r", trace_id,
+                     get_guardrails().redact(question), get_guardrails().redact(query))
+            steps.append({"stage": "context_merge",
+                          "detail": f"{get_guardrails().redact(question)!r} -> {get_guardrails().redact(query)!r}",
+                          "ms": None})
         qvec = self.embedder.embed_query(query)
         ranked, best = self._retrieve(query, trace_id, steps, query_vec=qvec)
         retries = 0
         while best < thr and retries < self.s.max_retrieve_retries:
             new_query = self._reformulate(query)
-            log.info("[%s] 低于阈值(%.4f<%.4f) 改写查询 | %r -> %r", trace_id, best, thr, query, new_query)
-            steps.append({"stage": f"reformulate_r{retries + 1}", "detail": f"{query!r} -> {new_query!r}", "ms": None})
+            gr = get_guardrails()
+            log.info("[%s] 低于阈值(%.4f<%.4f) 改写查询 | %r -> %r", trace_id, best, thr,
+                     gr.redact(query)[:60], gr.redact(new_query)[:60])
+            steps.append({"stage": f"reformulate_r{retries + 1}", "detail": f"{gr.redact(query)!r} -> {gr.redact(new_query)!r}", "ms": None})
             query = new_query
             ranked, best = self._retrieve(query, trace_id, steps, retry=retries + 1)
             retries += 1
@@ -393,27 +399,68 @@ class RAGPipeline:
         # 居民 / 当事人 / 投诉人（含显式自述或默认）
         return "resident"
 
+    # 强制补全前缀：以角色专属开口句式收尾 prompt，利用续写机制锁定正确人称（兜底指令跟随失效）。
+    ROLE_OPEN = {
+        "resident": "请直接以「你可以」开头作答（不要写「你（调解员）」等他人称谓）：",
+        "mediator": "请直接以「你（调解员）应」开头作答（不要写「你可以用手机录」这种给居民的建议）：",
+        "property": "请直接以「你（物业）应」开头作答（不要写「你可以用手机录」这种给居民的建议）：",
+        "grid_worker": "请直接以「你（网格员）应」开头作答（不要写「你可以用手机录」这种给居民的建议）：",
+    }
+
+    # 角色专属 system 人设：把"视角/称谓"写进 system（基础人设权重高于长 user prompt），
+    # 保证居民/调解员/物业/网格员看到的回答从开口称谓就明显不同。
+    ROLE_SYSTEM = {
+        "resident": (
+            "你正在协助一位遇到邻里/物业/家庭矛盾的【居民（当事人/投诉人）】。"
+            "请用『你可以…』的口吻，直接给这位居民本人能执行的维权动作建议；"
+            "若资料以调解员视角写（如『引导受害方留存证据』），必须转换为居民本人动作（『你可以用手机录下证据』）。"
+        ),
+        "mediator": (
+            "你正在协助一位【社区调解员/居委会工作人员】处理矛盾。"
+            "请用『你（调解员）应…』的口吻，给出调解员本人要执行的处置动作"
+            "（受理登记、核实走访、约谈双方、组织调解、签订约定、回访）；"
+            "绝对不要把动作推给居民（禁止出现『居民应…』『受害方应…』）。"
+        ),
+        "property": (
+            "你正在协助一位【物业服务人员（管家/工程/安保）】处理矛盾。"
+            "请用『你（物业）应…』的口吻，给出物业方要执行的动作"
+            "（现场查勘、台账/工单记录、协调工程或安保、向业主反馈、上报社区）；"
+            "禁止出现『居民应…』『受害方应…』。"
+        ),
+        "grid_worker": (
+            "你正在协助一位【网格员/社工】一线走访处置。"
+            "请用『你（网格员）应…』的口吻，给出一线走访动作"
+            "（上门安全注意、证据固定、联动社区/派出所/民政、文书记录）；"
+            "禁止出现『居民应…』『受害方应…』。"
+        ),
+    }
+
     def _role_guidance(self, role: str, known_facts: dict[str, str] | None = None) -> str:
-        """按角色返回生成约束，嵌进 _generate 的提示词。"""
         known = known_facts or {}
         known_dims = "、".join(known.keys()) if known else ""
         if role == "mediator":
             return (
-                "【对话对象】社区调解员 / 社工 / 居委会工作人员。\n"
-                "【回答要求】按专业流程组织：受理登记→核实走访→组织调解→签订约定→回访。"
-                "直接引用知识库步骤原文，专业口吻，不废话不客套。\n"
+                "【对话对象】社区调解员 / 社工 / 居委会工作人员（你就是一线调解人）。\n"
+                "【格式铁律】每条建议必须以『你（调解员）应/可…』开头，绝对不能写成给居民的第三人称。\n"
+                "示例：用户问噪音怎么办 →『你（调解员）应上门核实噪音源与时段，分别约谈双方做好笔录，"
+                "并依据管理规约要求装修方在22:00-7:00禁止高噪音施工[1]。』\n"
+                "按专业流程推进：受理登记→核实走访→组织调解→签订约定→回访。\n"
             )
         if role == "property":
             return (
-                "【对话对象】物业服务人员（管家/工程/安保等）。\n"
-                "【回答要求】从物业职责角度给可执行动作：现场核实、台账记录、协调工程/安保、"
-                "向业主反馈、上报社区。物业工作口吻，简洁直接。\n"
+                "【对话对象】物业服务人员（管家/工程/安保等，你就是物业方）。\n"
+                "【格式铁律】每条建议必须以『你（物业）应/可…』开头，绝对不能写成给居民的第三人称。\n"
+                "示例：用户问漏水怎么办 →『你（物业）应现场查勘渗漏点，登记台账并协调工程维修，"
+                "同时向双方反馈责任认定进度[1]。』\n"
+                "从物业职责给动作：现场核实、台账/工单、协调工程或安保、向业主反馈、上报社区。\n"
             )
         if role == "grid_worker":
             return (
-                "【对话对象】网格员 / 社工（一线走访人员）。\n"
-                "【回答要求】从一线走访视角给行动指引：上门安全注意、证据固定、联动资源（"
-                "社区/派出所/民政）、文书模板。务实口吻，关注执行细节。\n"
+                "【对话对象】网格员 / 社工（一线走访人员，你就是上门的人）。\n"
+                "【格式铁律】每条建议必须以『你（网格员）应/可…』开头，绝对不能写成给居民的第三人称。\n"
+                "示例：用户反映独居老人异常 →『你（网格员）应敲门确认老人安全，联动社区与家属，"
+                "必要时报民政纳入关爱台账[1]。』\n"
+                "从一线走访给行动指引：上门安全、证据固定、联动资源（社区/派出所/民政）、文书记录。\n"
             )
         # resident（默认）
         ask_rule = (
@@ -427,12 +474,11 @@ class RAGPipeline:
             "只在信息确实严重不足时，才可在建议末尾简短提一句还需要什么信息。"
         )
         return (
-            "【对话对象】居民 / 业主 / 当事人（遇到矛盾的一方）。\n"
-            "【回答要求】\n"
-            "1) 不要任何客套话（禁止「别急」「理解你的困扰」「抱歉听到这些」），直接给建议。\n"
-            "2) 站在『你能做什么』的角度。知识库很多是从调解员视角写的，必须转换为对居民的行动建议"
-            "（例：『调解员应上门走访』→『你可以请物业或社区上门核实，自己同时留存录音/视频』）；"
-            "绝不能把『调解员要做的事』当成『你要做的事』。\n"
+            "【对话对象】居民 / 业主 / 当事人（遇到矛盾的一方，你就是受害者/投诉人）。\n"
+            "【格式铁律】每条建议必须以『你可以/应该…』开头，站在『你能做什么』的角度。\n"
+            "【视角转换】知识库大多是从调解员视角写的（如『引导受害方留存证据』），必须转换为居民本人动作："
+            "→『你可以用手机录下噪音、保留视频证据，并请物业或社区上门核实』；"
+            "绝不能把『调解员/物业要做的动作』直接当成『你要做的动作』。\n"
             f"{ask_rule}\n"
             "4) 一次只给最紧急、最可执行的 2-4 条，每条一句话带过，不要展开解释『为什么这么做』。\n"
             "5) 法条用大白话解释，不要念原文。\n"
@@ -791,7 +837,6 @@ class RAGPipeline:
 
         prompt = (
             "你是社区矛盾调解助理，必须严格基于下方「相关资料」作答。\n"
-            f"本次对话识别到的【用户身份】={role_label}\n{role_g}"
             f"{fact_block}{asked_block}{profile_block}"
             f"{gratitude_override}"
             "硬性要求：\n"
@@ -812,7 +857,18 @@ class RAGPipeline:
             "   d) 用户感谢/夸奖时自然简短回应（如『不客气，有需要随时问』），绝不自我介绍或背定位话术。\n"
             "   e) 【严禁编造用户细节】引用用户描述时严格用原话原意，不得添油加醋。\n"
             "   f) 每条建议一句话带过，小建议不要展开长篇解释，不要每条都配『为什么这么做』。\n\n"
-            f"相关资料：\n{context}\n\n用户的问题是：{question}"
+            f"相关资料：\n{context}\n\n"
+            f"【最后强调·视角转换】本次对话对象身份 = {role_label}。{role_g}"
+            "资料中的建议若以第三方/调解员视角撰写（如『引导受害方留存证据』『要求装修方停止』），"
+            "必须按上方身份改写为该身份本人要执行的动作，绝不能直接套用原文人称。\n"
+            "【示范】同样面对『楼上装修噪音』，四种身份的开头必须不同：\n"
+            "· 居民：『你可以用手机录下噪音视频，并请物业上门核实…』\n"
+            "· 调解员：『你（调解员）应上门核实噪音源，分别约谈双方并做好笔录…』\n"
+            "· 物业：『你（物业）应现场查勘渗漏/噪音点，登记台账并协调工程整改…』\n"
+            "· 网格员：『你（网格员）应上门了解实情，联动社区与民警固定证据…』\n"
+            "若你的回答开头是『你可以用手机录』却不是居民身份，说明你忽略了身份，必须重答。\n\n"
+            f"用户的问题是：{question}\n"
+            + self.ROLE_OPEN[role]
         )
         t = time.perf_counter()
         # 多轮对话：system + 历史对话 + 当前（带检索资料的）问题
@@ -822,8 +878,8 @@ class RAGPipeline:
                 "content": (
                     "社区矛盾调解助理。你的全部回答必须严格依据用户提供的检索资料，"
                     "绝不外推或编造资料中不存在的法条与事实；资料不足时基于已有内容给建议，不要强调自己没有。"
-                    f"本次对话对象身份为：{role_label}，请从该角色视角组织回答。"
-                    "这是一段【连续对话】，核心纪律："
+                    + self.ROLE_SYSTEM[role]
+                    + "这是一段【连续对话】，核心纪律："
                     "1) 用户的当前发言可能是在回答你上一轮的追问，务必结合上文语境理解；"
                     "2) 【绝对禁止重复追问】——若用户已在历史对话中透露过某项信息（如持续时长、"
                     "是否沟通过、对方态度、是否找过物业等），你绝不能再问同一维度的问题；"

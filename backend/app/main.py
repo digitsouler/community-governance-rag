@@ -312,7 +312,8 @@ class Handler(BaseHTTPRequestHandler):
                 provider = None
             t0 = time.perf_counter()
             log.info("[%s] POST /api/chat | sid=%s | user=%s | provider=%s | 历史=%d | q=%r",
-                     req_id, session_id, user_id, provider or settings.default_llm, len(history), question[:60])
+                     req_id, session_id, user_id, provider or settings.default_llm, len(history),
+                     gr.redact(question)[:60])
             use_stream = bool(data.get("stream"))
 
             # ④ 语义缓存命中 → 短路返回（仅非流式；含 PII 的答案不缓存，避免泄露）

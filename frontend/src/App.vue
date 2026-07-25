@@ -46,11 +46,44 @@ async function loadProfile(sid) {
   } catch (e) { caseProfile.value = null }
 }
 
-const examples = [
-  '楼上漏水导致我家天花板发霉怎么办',
-  '邻居私装地锁占用公共车位，其他业主如何处理？',
-  '家里反复发生肢体冲突，如何申请人身安全保护？'
-]
+const examples = computed(() => {
+  const r = userRole.value || 'resident'
+  const map = {
+    resident: [
+      '楼上漏水导致我家天花板发霉怎么办',
+      '邻居私装地锁占用公共车位，其他业主如何处理？',
+      '家里反复发生肢体冲突，如何申请人身安全保护？',
+    ],
+    property: [
+      '业主因为漏水投诉到物业，我们物业在调解里具体要承担什么职责？',
+      '邻里噪音这种事，物业有没有强制执法权？还是只能协调？',
+      '业主拒交物业费，我们物业该怎么处理？',
+    ],
+    mediator: [
+      '调解邻里纠纷一般分哪几个步骤？首次上门要注意什么？',
+      '调解达成协议后对方反悔不履行，有没有法律约束力？',
+      '遇到当事人情绪激动甚至动手的情况，调解员怎么处置？',
+    ],
+    grid_worker: [
+      '网格员走访发现独居老人多日未出门，该怎么处理？',
+      '小区里发现疑似家暴情况，网格员第一时间该做什么？',
+      '居民反映的垃圾分类问题一直没解决，怎么向上级反馈推动？',
+    ],
+  }
+  return map[r] || map.resident
+})
+
+// 欢迎语与副标题：根据选中角色动态切换
+const welcomeText = computed(() => {
+  const r = userRole.value || 'resident'
+  const map = {
+    resident: { title: '你好，我是社区矛盾调解助理', sub: '描述你遇到的邻里 / 物业 / 家庭矛盾，我会结合知识库给出处置建议、相关法条与调解步骤，并标注依据来源。' },
+    property: { title: '你好，我是社区矛盾调解助理', sub: '你是物业工作人员视角。描述遇到的业主投诉 / 邻里纠纷 / 设施争议，我会从物业职责角度给出处置建议与操作步骤。' },
+    mediator: { title: '你好，我是社区矛盾调解助理', sub: '你是调解员 / 居委会视角。描述正在处理的矛盾纠纷，我会按调解流程给出处置建议、法律依据与话术指引。' },
+    grid_worker: { title: '你好，我是社区矛盾调解助理', sub: '你是网格员 / 社工视角。描述走访中发现的问题或居民诉求，我会给出一线上门处置的行动指引与联动方案。' },
+  }
+  return map[r] || map.resident
+})
 
 onMounted(async () => {
   try {
@@ -68,6 +101,7 @@ onMounted(async () => {
 async function send(text) {
   const question = (text ?? input.value).trim()
   if (!question || loading.value) return
+  if (!userRole.value) { alert('请先选择你的身份（居民 / 物业 / 调解员 / 网格员），再开始对话'); return }
   input.value = ''
   messages.push({ role: 'user', content: question })
   messages.push({ role: 'bot', content: '', loading: true })
@@ -79,11 +113,28 @@ async function send(text) {
     // 短期记忆：会话历史由后端按 session_id 拉取，前端不再拼接 history
     // stream=true 走 SSE：首字即可见，体感远快于等整段
     const sid = await ensureSession()
+    const controller = new AbortController()
+    const timer = setTimeout(() => controller.abort(), 60000) // 60s 超时保护（含 LLM 耗时）
     const resp = await fetch('/api/chat', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json', 'X-User-Id': userId },
-      body: JSON.stringify({ question, provider: currentModel.value, session_id: sid, stream: true, user_role: userRole.value || undefined })
+      body: JSON.stringify({ question, provider: currentModel.value, session_id: sid, stream: true, user_role: userRole.value || undefined }),
+      signal: controller.signal,
     })
+    clearTimeout(timer)
+    // 非 200 响应（护栏拦截/限流等）：直接读 JSON 错误体，不走 SSE
+    if (!resp.ok) {
+      let errBody = { error: `请求失败（HTTP ${resp.status}）` }
+      try { errBody = await resp.json() } catch {}
+      // 护栏拦截：给用户友好提示
+      const msg = errBody.error || errBody.message || errBody
+      const friendlyMsg = (resp.status === 400 && String(msg).includes('不安全'))
+        ? '⚠️ 该请求被安全护栏拦截（可能包含注入指令），已拒绝处理。' : `⚠️ ${msg}`
+      messages[messages.length - 1].content = friendlyMsg
+      messages[messages.length - 1].loading = false
+      loading.value = false
+      return
+    }
     const last = messages[messages.length - 1]
     last.loading = false
     const reader = resp.body.getReader()
@@ -135,7 +186,11 @@ async function send(text) {
   } catch (e) {
     const last = messages[messages.length - 1]
     last.loading = false
-    last.content = '请求失败：' + (e.message || e)
+    if (e.name === 'AbortError') {
+      last.content = '⚠️ 请求超时（60秒无响应），请稍后重试。'
+    } else {
+      last.content = '请求失败：' + (e.message || e)
+    }
   } finally {
     loading.value = false
     await nextTick()
@@ -147,7 +202,7 @@ function scrollToBottom() {
   if (chatArea.value) chatArea.value.scrollTop = chatArea.value.scrollHeight
 }
 
-// 将回答中的 [N] 引用标记渲染为悬浮 tooltip（显示来源标题+相关度）
+// 将回答中的 [N] 引用标记渲染为悬浮 tooltip（显示来源完整信息：标题/类别/相关度/摘要/法条）
 function renderAnswer(text, sources) {
   if (!text) return ''
   // 安全转义 HTML 特殊字符
@@ -158,7 +213,22 @@ function renderAnswer(text, sources) {
       const idx = parseInt(num) - 1
       const s = sources[idx]
       if (!s) return match
-      const tip = `标题：${s.title}\n类别：${s.category} | 相关度：${s.score}`
+      const lines = [
+        `📄 ${s.title}`,
+        `━━━━━━━━━━━━━━━`,
+        `类别：${s.category || '未知'}  |  相关度：${s.score || '-'}`,
+      ]
+      if (s.content) {
+        let summary = s.content.slice(0, 300)
+        if (s.content.length > 300) {
+          const lastPeriod = Math.max(summary.lastIndexOf('。'), summary.lastIndexOf('；'), summary.lastIndexOf('.'))
+          if (lastPeriod > 100) summary = summary.slice(0, lastPeriod + 1)
+          else summary += '…'
+        }
+        lines.push(``, `📝 摘要：`, summary)
+      }
+      if (s.legal_basis) lines.push(``, `⚖️ 法条：${s.legal_basis}`)
+      const tip = lines.join('\n')
       return `<span class="ref-tag" data-tip="${tip.replace(/"/g, '&quot;')}">[${num}]</span>`
     })
   }
@@ -515,12 +585,10 @@ function kbGoPage(delta) {
 
     <div v-if="tab === 'chat'" class="chat-area" ref="chatArea">
       <div v-if="messages.length === 0" class="empty">
-        <h2>你好，我是社区矛盾调解助理</h2>
-        <p>描述你遇到的邻里 / 物业 / 家庭矛盾，我会结合知识库给出处置建议、相关法条与调解步骤，并标注依据来源。</p>
-
-        <!-- 身份选择器：首次对话前必须选身份 -->
-        <div v-if="showRolePicker" class="role-picker">
-          <p class="role-picker-hint">请先选择你的身份，我会据此调整回答视角：</p>
+        <!-- 未选角色时：全屏角色选择器，遮挡其他内容 -->
+        <div v-if="showRolePicker" class="role-overlay">
+          <h2>👋 欢迎使用社区矛盾调解助手</h2>
+          <p class="role-overlay-sub">请先选择你的身份，我会据此调整回答视角和推荐问题</p>
           <div class="role-options">
             <button
               v-for="r in ROLE_OPTIONS" :key="r.value"
@@ -533,10 +601,14 @@ function kbGoPage(delta) {
           </div>
         </div>
 
-        <div class="chips" v-if="!showRolePicker || userRole">
-          <span class="chip" v-for="ex in examples" :key="ex" @click="send(ex)">{{ ex }}</span>
-        </div>
-        <p v-if="showRolePicker" class="role-picker-note">选择身份后即可开始对话，也可随时切换</p>
+        <!-- 已选角色后：显示欢迎语 + 角色化推荐问题 -->
+        <template v-else>
+          <h2>{{ welcomeText.title }}</h2>
+          <p>{{ welcomeText.sub }}</p>
+          <div class="chips">
+            <span class="chip" v-for="ex in examples" :key="ex" @click="send(ex)">{{ ex }}</span>
+          </div>
+        </template>
       </div>
 
       <div v-for="(m, i) in messages" :key="i" class="msg" :class="m.role">
@@ -549,12 +621,19 @@ function kbGoPage(delta) {
           <div v-if="m.loading" class="typing">正在检索知识库并生成…</div>
           <div v-else class="answer-body" v-html="renderAnswer(m.content, m.sources)"></div>
 
-          <!-- 来源：紧凑悬浮卡片（鼠标悬浮显示详情） -->
+          <!-- 来源：可展开卡片（点击展开完整内容） -->
           <div v-if="m.sources && m.sources.length" class="sources-compact">
-            <span class="sources-label">📎 召回 {{ m.sources.length }} 篇文档</span>
-            <span v-for="s in m.sources" :key="s.id" class="source-chip" :title="s.title + '\n' + s.category + ' | 相关度 ' + s.score">
-              {{ s.title }}
-            </span>
+            <span class="sources-label">📎 相关资料（{{ m.sources.length }} 篇）</span>
+            <template v-for="s in m.sources" :key="s.id">
+              <details class="source-detail">
+                <summary>{{ s.title }}</summary>
+                <div class="source-body">
+                  <div class="source-meta">{{ s.category }} · 相关度 {{ s.score }}</div>
+                  <div class="source-content" v-if="s.content">{{ s.content }}</div>
+                  <div class="source-law" v-if="s.legal_basis">⚖️ {{ s.legal_basis }}</div>
+                </div>
+              </details>
+            </template>
           </div>
 
           <details v-if="m.trace" class="trace" :open="m.route === 'retrieve'">
