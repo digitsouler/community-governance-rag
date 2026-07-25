@@ -25,7 +25,7 @@ class Settings(BaseSettings):
     # DeepSeek
     deepseek_api_key: str = ""
     deepseek_base_url: str = "https://api.deepseek.com/v1"
-    deepseek_model: str = "deepseek-v4-flash"
+    deepseek_model: str = "deepseek-chat"
 
     # 智谱 GLM
     zhipu_api_key: str = ""
@@ -46,9 +46,9 @@ class Settings(BaseSettings):
     vector_dim: int = 2048  # 智谱 embedding-3 维度
 
     # ---- 短期记忆（会话存储）----
-    # 留空则内存降级模式（无需起 Redis，便于无依赖开发）；
-    # 填 redis://host:port 启用 Redis 持久化会话（推荐生产/本地）。
-    redis_url: str = "redis://127.0.0.1:6379"
+    # 留空则内存降级模式
+    # 填 redis://host:port 启用 Redis 持久化会话
+    redis_url: str = "127.0.0.1:6379"
 
     # ---- 检索参数 ----
     top_k: int = 8
