@@ -48,7 +48,32 @@ class Settings(BaseSettings):
     # ---- 短期记忆（会话存储）----
     # 留空则内存降级模式
     # 填 redis://host:port 启用 Redis 持久化会话
-    redis_url: str = "127.0.0.1:6379"
+    redis_url: str = "redis://127.0.0.1:6379"
+
+    # ---- 网关层：多用户隔离 / 限流 ----
+    rate_limit_enabled: bool = True
+    rl_user_per_min: int = 12        # 单用户每分钟请求上限（防单个账号狂刷）
+    rl_ip_per_min: int = 40          # 单 IP 每分钟上限（防同 IP 多账号/匿名蹭）
+    rl_global_per_min: int = 600      # 全局兜底（防总过载）
+    auth_required: bool = False       # demo 不强制登录，前端自生成稳定 user_id 即可
+
+    # ---- 网关层：弹性降级（LLM 超时 / 重试 / 熔断 / 降级链）----
+    llm_timeout: float = 45.0         # 单次 LLM 调用硬超时（秒）
+    llm_max_retries: int = 1          # 瞬时失败（429/5xx/超时）重试次数，指数退避
+    circuit_error_rate: float = 0.5   # 熔断错误率阈值（窗口内失败占比）
+    circuit_min_calls: int = 10       # 进入熔断统计的最小调用数
+    circuit_open_seconds: int = 30    # 熔断持续时间
+    fallback_providers: list[str] = ["zhipu", "qwen"]  # 主模型失败时的降级链
+
+    # ---- 网关层：语义缓存（查询向量近邻命中短路）----
+    semantic_cache_enabled: bool = True
+    semantic_cache_sim: float = 0.92  # 余弦相似度命中阈值
+    semantic_cache_size: int = 500    # 进程内缓存容量上限
+
+    # ---- 网关层：护栏 / 审计 ----
+    guardrails_enabled: bool = True   # 输入 prompt 注入检测 + 输出 PII 脱敏
+    pii_redact_enabled: bool = True
+    audit_enabled: bool = True        # append-only 审计日志（user/ip/session/命中）
 
     # ---- 检索参数 ----
     top_k: int = 8

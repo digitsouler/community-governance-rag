@@ -259,6 +259,22 @@ body {
 }
 .chip:hover { border-color: var(--primary); color: var(--primary); }
 
+/* 身份选择器 */
+.role-picker { margin-top: 20px; text-align: left; }
+.role-picker-hint { font-size: 14px; color: var(--text); margin-bottom: 10px; font-weight: 500; }
+.role-options { display: grid; grid-template-columns: 1fr 1fr; gap: 10px; max-width: 520px; margin: 0 auto; }
+.role-opt {
+  display: flex; flex-direction: column; align-items: flex-start; gap: 4px;
+  padding: 14px 16px; border: 2px solid var(--border); border-radius: 12px;
+  background: #fff; cursor: pointer; transition: all .15s;
+  text-align: left;
+}
+.role-opt:hover { border-color: var(--primary); background: var(--primary-soft); }
+.role-opt.active { border-color: var(--primary); background: var(--primary-soft); box-shadow: 0 0 0 3px rgba(47,109,240,.15); }
+.role-opt-label { font-size: 14px; font-weight: 600; color: var(--text); }
+.role-opt-desc { font-size: 12px; color: var(--muted); }
+.role-picker-note { margin-top: 12px; font-size: 12px; color: var(--muted); }
+
 /* 长期记忆可视化：案件档案条 */
 .profile-bar {
   background: var(--primary-soft);
@@ -307,4 +323,36 @@ body {
   border: 1px dashed var(--border);
   border-radius: 8px;
   padding: 4px 10px;
+}
+
+/* 回答正文（支持 [N] 引用渲染） */
+.answer-body { line-height: 1.7; }
+.ref-tag {
+  color: var(--primary);
+  font-weight: 600;
+  cursor: default;
+  position: relative;
+  padding: 0 2px;
+  border-radius: 3px;
+}
+.ref-tag:hover { background: var(--primary-soft); }
+.ref-tag:hover::after {
+  content: attr(data-tip);
+  position: absolute;
+  bottom: 100%; left: 50%; transform: translateX(-50%);
+  background: #1f2733; color: #fff; font-size: 12px; line-height: 1.5;
+  white-space: pre-wrap; padding: 8px 12px; border-radius: 8px;
+  width: max-content; max-width: 320px; z-index: 10;
+  box-shadow: 0 4px 16px rgba(0,0,0,.2); margin-bottom: 6px;
+  pointer-events: none;
+}
+
+/* 紧凑来源卡片（悬浮显示详情） */
+.sources-compact { margin-top: 10px; display: flex; flex-wrap: wrap; gap: 6px; align-items: center; }
+.sources-label { font-size: 12px; color: var(--muted); margin-right: 4px; }
+.source-chip {
+  font-size: 11.5px; padding: 3px 10px; border-radius: 999px;
+  background: var(--primary-soft); color: var(--primary);
+  border: 1px solid rgba(47,109,240,.25); cursor: default;
+  white-space: nowrap; max-width: 200px; overflow: hidden; text-overflow: ellipsis;
 }

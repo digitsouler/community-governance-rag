@@ -66,10 +66,10 @@ class SessionStore:
         return self._mode
 
     # ---------- 写 ----------
-    def create_session(self, title: str = "") -> str:
+    def create_session(self, title: str = "", owner: str = "") -> str:
         sid = uuid.uuid4().hex[:16]
         now = time.time()
-        meta = {"title": title, "created_at": now, "updated_at": now, "msg_count": 0}
+        meta = {"title": title, "created_at": now, "updated_at": now, "msg_count": 0, "owner": owner}
         if self._mode == "redis":
             assert self._redis is not None
             self._redis.delete(f"session:{sid}")
@@ -127,6 +127,7 @@ class SessionStore:
             return {
                 "id": sid,
                 "title": meta.get("title", ""),
+                "owner": meta.get("owner", ""),
                 "created_at": float(meta.get("created_at", 0)),
                 "updated_at": float(meta.get("updated_at", 0)),
                 "msg_count": int(meta.get("msg_count", 0)),
@@ -137,22 +138,22 @@ class SessionStore:
                 return None
             return {"id": sid, **meta}
 
-    def list_sessions(self) -> list[dict]:
-        """按 updated_at 倒序返回会话概览（用于左侧历史列表）。"""
+    def list_sessions(self, owner: str = "") -> list[dict]:
+        """按 updated_at 倒序返回会话概览；传 owner 时仅返回该用户的会话（多用户隔离）。"""
         if self._mode == "redis":
             assert self._redis is not None
             ids = self._redis.zrevrange("sessions", 0, -1)
             out = []
             for sid in ids:
                 m = self.get_session(sid)
-                if m:
+                if m and (not owner or m.get("owner") == owner):
                     out.append(m)
             return out
         with self._lock:
-            return sorted(
-                ({"id": sid, **meta} for sid, meta in self._meta.items()),
-                key=lambda x: x["updated_at"], reverse=True,
-            )
+            items = ({"id": sid, **meta} for sid, meta in self._meta.items())
+            if owner:
+                items = [m for m in items if m.get("owner") == owner]
+            return sorted(items, key=lambda x: x["updated_at"], reverse=True)
 
     # ---------- 删除 ----------
     def delete_session(self, sid: str) -> bool:

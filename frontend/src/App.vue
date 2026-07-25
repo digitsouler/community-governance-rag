@@ -15,13 +15,32 @@ const sessions = ref([])
 // 长期记忆：当前会话沉淀的结构化案件档案（可视化给用户看）
 const caseProfile = ref(null)
 const profileOpen = ref(false)
+
+// 多用户隔离：前端自生成稳定 user_id（demo 级身份，非登录鉴权），随请求带上供后端隔离/限流
+const USER_ID_KEY = 'cg_user_id'
+let userId = localStorage.getItem(USER_ID_KEY)
+if (!userId) {
+  userId = 'u_' + (crypto.randomUUID ? crypto.randomUUID().slice(0, 12) : Math.random().toString(36).slice(2, 14))
+  localStorage.setItem(USER_ID_KEY, userId)
+}
+const AUTH = { 'X-User-Id': userId }
+
+// 身份选择器：首次对话前引导用户选择角色，后续每条请求都带上 user_role
+const ROLE_OPTIONS = [
+  { value: 'resident', label: '居民 / 业主', desc: '遇到矛盾的一方，想了解怎么办' },
+  { value: 'property', label: '物业人员', desc: '物业服务/管家/工程/安保视角' },
+  { value: 'mediator', label: '调解员 / 居委会', desc: '社区调解/居委会工作人员' },
+  { value: 'grid_worker', label: '网格员 / 社工', desc: '一线走访/社工/网格员视角' },
+]
+const userRole = ref('')
+const showRolePicker = computed(() => !userRole.value && messages.length === 0)
 function updateProfile(p) {
   caseProfile.value = (p && Object.keys(p).length) ? p : caseProfile.value
 }
 async function loadProfile(sid) {
   if (!sid) { caseProfile.value = null; return }
   try {
-    const r = await fetch('/api/sessions/' + encodeURIComponent(sid) + '/profile')
+    const r = await fetch('/api/sessions/' + encodeURIComponent(sid) + '/profile', { headers: AUTH })
     const d = await r.json()
     caseProfile.value = (d.profile && Object.keys(d.profile).length) ? d.profile : null
   } catch (e) { caseProfile.value = null }
@@ -62,8 +81,8 @@ async function send(text) {
     const sid = await ensureSession()
     const resp = await fetch('/api/chat', {
       method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ question, provider: currentModel.value, session_id: sid, stream: true })
+      headers: { 'Content-Type': 'application/json', 'X-User-Id': userId },
+      body: JSON.stringify({ question, provider: currentModel.value, session_id: sid, stream: true, user_role: userRole.value || undefined })
     })
     const last = messages[messages.length - 1]
     last.loading = false
@@ -128,6 +147,24 @@ function scrollToBottom() {
   if (chatArea.value) chatArea.value.scrollTop = chatArea.value.scrollHeight
 }
 
+// 将回答中的 [N] 引用标记渲染为悬浮 tooltip（显示来源标题+相关度）
+function renderAnswer(text, sources) {
+  if (!text) return ''
+  // 安全转义 HTML 特殊字符
+  let safe = text.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;')
+  // 将 [N] 替换为带 data 属性的 span，CSS :hover 显示 tooltip
+  if (sources && sources.length) {
+    safe = safe.replace(/\[(\d+)\]/g, (match, num) => {
+      const idx = parseInt(num) - 1
+      const s = sources[idx]
+      if (!s) return match
+      const tip = `标题：${s.title}\n类别：${s.category} | 相关度：${s.score}`
+      return `<span class="ref-tag" data-tip="${tip.replace(/"/g, '&quot;')}">[${num}]</span>`
+    })
+  }
+  return safe
+}
+
 // ---------- 会话管理（短期记忆） ----------
 function fmtTime(ts) {
   if (!ts) return ''
@@ -138,7 +175,7 @@ function fmtTime(ts) {
 
 async function refreshSessions() {
   try {
-    const r = await fetch('/api/sessions')
+    const r = await fetch('/api/sessions', { headers: AUTH })
     const d = await r.json()
     sessions.value = d.sessions || []
   } catch (e) { console.warn('获取会话列表失败', e) }
@@ -147,7 +184,7 @@ async function refreshSessions() {
 async function ensureSession() {
   if (sessionId.value) return sessionId.value
   // 首次发消息自动建会话
-  const r = await fetch('/api/sessions', { method: 'POST' })
+  const r = await fetch('/api/sessions', { method: 'POST', headers: AUTH })
   const d = await r.json()
   sessionId.value = d.session_id
   await refreshSessions()
@@ -160,8 +197,9 @@ async function newChat() {
   messages.splice(0, messages.length)
   input.value = ''
   caseProfile.value = null
+  userRole.value = ''  // 重置身份选择，让用户重新选
   try {
-    const r = await fetch('/api/sessions', { method: 'POST' })
+    const r = await fetch('/api/sessions', { method: 'POST', headers: AUTH })
     const d = await r.json()
     sessionId.value = d.session_id
     await refreshSessions()
@@ -172,7 +210,7 @@ async function newChat() {
 async function loadSession(id) {
   if (loading.value) return
   try {
-    const r = await fetch('/api/sessions/' + encodeURIComponent(id))
+    const r = await fetch('/api/sessions/' + encodeURIComponent(id), { headers: AUTH })
     const d = await r.json()
     sessionId.value = id
     messages.splice(0, messages.length)
@@ -190,7 +228,7 @@ async function loadSession(id) {
 async function deleteSession(id) {
   if (!confirm('确定删除该会话？此操作不可恢复。')) return
   try {
-    await fetch('/api/sessions/' + encodeURIComponent(id), { method: 'DELETE' })
+    await fetch('/api/sessions/' + encodeURIComponent(id), { method: 'DELETE', headers: AUTH })
     if (sessionId.value === id) {
       sessionId.value = ''
       messages.splice(0, messages.length)
@@ -201,7 +239,7 @@ async function deleteSession(id) {
 }
 
 const routeLabel = { retrieve: '检索回答', direct: '直接回答', clarify: '需澄清', out_of_domain: '超出范围' }
-const roleLabel2 = { resident: '居民/当事人', mediator: '调解员/社工', property: '物业服务人员' }
+const roleLabel2 = { resident: '居民/业主', mediator: '调解员/居委会', property: '物业人员', grid_worker: '网格员/社工' }
 
 // 与后端 source_display_min_score 对齐：低于此相关度的命中视为噪音，不渲染来源卡片
 const SOURCE_MIN_SCORE = 0.3
@@ -479,9 +517,26 @@ function kbGoPage(delta) {
       <div v-if="messages.length === 0" class="empty">
         <h2>你好，我是社区矛盾调解助理</h2>
         <p>描述你遇到的邻里 / 物业 / 家庭矛盾，我会结合知识库给出处置建议、相关法条与调解步骤，并标注依据来源。</p>
-        <div class="chips">
+
+        <!-- 身份选择器：首次对话前必须选身份 -->
+        <div v-if="showRolePicker" class="role-picker">
+          <p class="role-picker-hint">请先选择你的身份，我会据此调整回答视角：</p>
+          <div class="role-options">
+            <button
+              v-for="r in ROLE_OPTIONS" :key="r.value"
+              :class="['role-opt', { active: userRole === r.value }]"
+              @click="userRole = r.value"
+            >
+              <span class="role-opt-label">{{ r.label }}</span>
+              <span class="role-opt-desc">{{ r.desc }}</span>
+            </button>
+          </div>
+        </div>
+
+        <div class="chips" v-if="!showRolePicker || userRole">
           <span class="chip" v-for="ex in examples" :key="ex" @click="send(ex)">{{ ex }}</span>
         </div>
+        <p v-if="showRolePicker" class="role-picker-note">选择身份后即可开始对话，也可随时切换</p>
       </div>
 
       <div v-for="(m, i) in messages" :key="i" class="msg" :class="m.role">
@@ -492,15 +547,14 @@ function kbGoPage(delta) {
             <span v-if="m.retries"> · 自纠错重试 {{ m.retries }} 次</span>
           </div>
           <div v-if="m.loading" class="typing">正在检索知识库并生成…</div>
-          <div v-else>{{ m.content }}</div>
+          <div v-else class="answer-body" v-html="renderAnswer(m.content, m.sources)"></div>
 
-          <div v-if="m.sources && m.sources.length" class="sources">
-            <div class="source-card" v-for="s in m.sources" :key="s.id">
-              <div class="s-title">📌 {{ s.title }}</div>
-              <div class="s-meta">{{ s.category }} · 相关度 {{ s.score }}</div>
-              <div class="s-content">{{ s.content }}</div>
-              <div class="s-law" v-if="s.legal_basis">⚖️ {{ s.legal_basis }}</div>
-            </div>
+          <!-- 来源：紧凑悬浮卡片（鼠标悬浮显示详情） -->
+          <div v-if="m.sources && m.sources.length" class="sources-compact">
+            <span class="sources-label">📎 召回 {{ m.sources.length }} 篇文档</span>
+            <span v-for="s in m.sources" :key="s.id" class="source-chip" :title="s.title + '\n' + s.category + ' | 相关度 ' + s.score">
+              {{ s.title }}
+            </span>
           </div>
 
           <details v-if="m.trace" class="trace" :open="m.route === 'retrieve'">

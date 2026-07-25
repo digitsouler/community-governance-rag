@@ -42,6 +42,14 @@ from app.log import get_logger, setup_logging
 from app.rag.pipeline import RAGPipeline
 from app.profile_store import get_profile_store
 from app.session_store import get_session_store
+from app.gateway import (
+    resolve_user,
+    get_ratelimiter,
+    get_guardrails,
+    get_semantic_cache,
+    audit,
+    error_payload,
+)
 
 log = get_logger("app.main")
 settings = get_settings()
@@ -90,6 +98,18 @@ class Handler(BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(body)
 
+    def _send_429(self, msg: str, trace_id: str, retry_after: int) -> None:
+        body = json.dumps(error_payload(msg, trace_id, 429), ensure_ascii=False).encode("utf-8")
+        self.send_response(429)
+        self.send_header("Content-Type", "application/json; charset=utf-8")
+        self.send_header("Access-Control-Allow-Origin", "*")
+        self.send_header("Access-Control-Allow-Headers", "Content-Type")
+        self.send_header("Retry-After", str(retry_after))
+        self.send_header("X-Trace-Id", trace_id)
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
     def do_OPTIONS(self):
         self._send(204, {})
 
@@ -130,15 +150,17 @@ class Handler(BaseHTTPRequestHandler):
                 self._send(200, {"status": "ok", **doc})
                 return
             self._send(400, {"error": "路径格式错误，应为 /api/kb/{id}/content"})
-        # 会话：列表
+        # 会话：列表（仅返回当前用户自己的会话）
         elif path == "/api/sessions":
-            items = get_session_store().list_sessions()
+            user_id = resolve_user(self.headers, self.client_address[0])
+            items = get_session_store().list_sessions(owner=user_id)
             self._send(200, {"status": "ok", "sessions": items})
         # 会话：完整消息
         elif path.startswith("/api/sessions/") and len([p for p in path.split("/") if p]) == 3:
             sid = unquote(path.split("/")[3])
+            user_id = resolve_user(self.headers, self.client_address[0])
             sess = get_session_store().get_session(sid)
-            if sess is None:
+            if sess is None or (sess.get("owner") and sess.get("owner") != user_id):
                 self._send(404, {"error": "会话不存在"})
                 return
             self._send(200, {"status": "ok", "session": sess,
@@ -146,12 +168,17 @@ class Handler(BaseHTTPRequestHandler):
         # 会话：结构化案件档案（长期记忆）
         elif path.startswith("/api/sessions/") and path.endswith("/profile"):
             sid = unquote(path.split("/")[3])
+            user_id = resolve_user(self.headers, self.client_address[0])
+            sess = get_session_store().get_session(sid)
+            if sess is None or (sess.get("owner") and sess.get("owner") != user_id):
+                self._send(404, {"error": "会话不存在"})
+                return
             prof = get_profile_store().get(sid)
             self._send(200, {"status": "ok", "session_id": sid, "profile": prof})
         else:
             self._send(404, {"error": "not found"})
 
-    def _stream_chat(self, session_id, question, provider, history, req_id):
+    def _stream_chat(self, session_id, question, provider, history, req_id, user_id, ip, has_pii, user_role=None):
         """SSE 流式问答：逐事件推送 route / delta / done / error，首字即可见。"""
         self.send_response(200)
         self.send_header("Content-Type", "text/event-stream; charset=utf-8")
@@ -160,6 +187,7 @@ class Handler(BaseHTTPRequestHandler):
         self.send_header("Access-Control-Allow-Origin", "*")
         self.end_headers()
         store = get_session_store()
+        gr = get_guardrails()
 
         def emit(ev: dict):
             try:
@@ -169,7 +197,7 @@ class Handler(BaseHTTPRequestHandler):
                 log.warning("[%s] SSE 写出失败: %s", req_id, e)
 
         try:
-            for ev in pipeline.query(question, provider, history=history, session_id=session_id, stream=True):
+            for ev in pipeline.query(question, provider, history=history, session_id=session_id, stream=True, user_role=user_role or None):
                 if ev.get("type") == "delta":
                     emit(ev)
                 elif ev.get("type") == "route":
@@ -178,9 +206,11 @@ class Handler(BaseHTTPRequestHandler):
                     res = ev["result"]
                     res["trace_id"] = res.get("trace_id", req_id)
                     res["session_id"] = session_id
+                    answer = gr.redact(res["answer"])  # ⑤ 输出护栏：PII 脱敏
+                    get_semantic_cache().put(question, answer, has_pii)  # ④ 回填语义缓存
                     emit({
                         "type": "done",
-                        "answer": res["answer"],
+                        "answer": answer,
                         "route": res["route"],
                         "sources": res["sources"],
                         "self_rag_retries": res["self_rag_retries"],
@@ -191,7 +221,9 @@ class Handler(BaseHTTPRequestHandler):
                         "trace_id": res["trace_id"],
                         "session_id": session_id,
                     })
-                    store.append_message(session_id, "assistant", res["answer"])
+                    store.append_message(session_id, "assistant", answer)
+                    audit("chat", trace_id=req_id, user_id=user_id, ip=ip, session_id=session_id,
+                          route=res["route"], model=res["model"], latency_ms=res["latency_ms"], stream=True)
             emit({"type": "end"})
         except Exception as e:  # noqa: BLE001
             log.error("[%s] SSE 处理异常 | %s", req_id, e)
@@ -213,9 +245,10 @@ class Handler(BaseHTTPRequestHandler):
             self._send(400, {"error": "invalid json"})
             return
 
-        # 会话：新建
+        # 会话：新建（记录归属用户）
         if path == "/api/sessions":
-            sid = get_session_store().create_session()
+            user_id = resolve_user(self.headers, self.client_address[0])
+            sid = get_session_store().create_session(owner=user_id)
             self._send(200, {"status": "ok", "session_id": sid})
             return
 
@@ -224,16 +257,49 @@ class Handler(BaseHTTPRequestHandler):
             question = (data.get("question") or "").strip()
             provider = data.get("provider")
             session_id = (data.get("session_id") or "").strip()
+            user_role = (data.get("user_role") or "").strip()  # 前端身份选择器传入
             if not question:
-                self._send(400, {"error": "question 不能为空"})
+                self._send(400, error_payload("question 不能为空", code=400))
                 return
-            # 短期记忆：会话历史从 Redis(或内存) 按 session_id 拉取，不再依赖前端传 history
+            user_id = resolve_user(self.headers, self.client_address[0])
+            ip = self.client_address[0]
+            req_id = uuid.uuid4().hex[:12]
+
+            # ① 限流：用户 + IP + 全局 三维度
+            rl = get_ratelimiter()
+            ok, retry = rl.check(f"user:{user_id}", settings.rl_user_per_min, 60)
+            if not ok:
+                self._send_429("单用户请求过于频繁，请稍后再试", req_id, retry)
+                return
+            ok, retry = rl.check(f"ip:{ip}", settings.rl_ip_per_min, 60)
+            if not ok:
+                self._send_429("当前 IP 请求过于频繁，请稍后再试", req_id, retry)
+                return
+            ok, retry = rl.check("global", settings.rl_global_per_min, 60)
+            if not ok:
+                self._send_429("服务繁忙，请稍后再试", req_id, retry)
+                return
+
+            # ② 输入护栏：prompt 注入检测（PII 仅标记，不阻断当事人描述案情）
+            gr = get_guardrails()
+            ok_in, reason, has_pii = gr.scan_input(question)
+            if not ok_in:
+                log.warning("[%s] 输入被护栏拦截 | reason=%s | user=%s", req_id, reason, user_id)
+                audit("blocked_input", trace_id=req_id, user_id=user_id, ip=ip, reason=reason)
+                self._send(400, error_payload("输入含不安全内容，已被拦截", req_id, 400), trace_id=req_id)
+                return
+
+            # ③ 会话归属校验 + 短期记忆加载
             store = get_session_store()
             if session_id:
+                sess = store.get_session(session_id)
+                if sess is None or (sess.get("owner") and sess.get("owner") != user_id):
+                    self._send(404, error_payload("会话不存在", req_id, 404), trace_id=req_id)
+                    return
                 history = store.get_messages(session_id)
             else:
                 # 兼容旧调用：无 session_id 则新建会话并把前端传来的 history 种入
-                session_id = store.create_session()
+                session_id = store.create_session(owner=user_id)
                 history = data.get("history") or []
                 if isinstance(history, list):
                     for m in history:
@@ -241,31 +307,50 @@ class Handler(BaseHTTPRequestHandler):
                             store.append_message(session_id, "user" if m["role"] == "user" else "assistant", m["content"])
             if not isinstance(history, list):
                 history = []
-            history = history[-12:]  # 兜底截断，pipeline 内部还会再规整
+            history = history[-12:]
             if provider and provider not in MODEL_REGISTRY:
                 provider = None
-            req_id = uuid.uuid4().hex[:12]
             t0 = time.perf_counter()
-            log.info("[%s] POST /api/chat | sid=%s | provider=%s | 历史=%d | q=%r",
-                     req_id, session_id, provider or settings.default_llm, len(history), question[:60])
+            log.info("[%s] POST /api/chat | sid=%s | user=%s | provider=%s | 历史=%d | q=%r",
+                     req_id, session_id, user_id, provider or settings.default_llm, len(history), question[:60])
             use_stream = bool(data.get("stream"))
+
+            # ④ 语义缓存命中 → 短路返回（仅非流式；含 PII 的答案不缓存，避免泄露）
+            if not use_stream:
+                cached = get_semantic_cache().get(question)
+                if cached is not None:
+                    store.append_message(session_id, "user", question)
+                    ans = gr.redact(cached)
+                    store.append_message(session_id, "assistant", ans)
+                    audit("chat", trace_id=req_id, user_id=user_id, ip=ip, session_id=session_id,
+                          route="cache", model="semantic-cache", cached=True)
+                    self._send(200, {
+                        "answer": ans, "route": "cache", "sources": [], "self_rag_retries": 0,
+                        "model": "semantic-cache", "latency_ms": 0,
+                        "case_profile": get_profile_store().get(session_id),
+                        "trace": {"steps": []}, "trace_id": req_id, "session_id": session_id, "cached": True,
+                    }, trace_id=req_id)
+                    return
+
             try:
                 # 先落「用户问题」到会话存储，再生成答案
                 store.append_message(session_id, "user", question)
                 if use_stream:
-                    self._stream_chat(session_id, question, provider, history, req_id)
+                    self._stream_chat(session_id, question, provider, history, req_id, user_id, ip, has_pii, user_role=user_role or None)
                     return
-                result = pipeline.query(question, provider, history=history, session_id=session_id)
+                result = pipeline.query(question, provider, history=history, session_id=session_id, user_role=user_role or None)
                 result["trace_id"] = result.get("trace_id", req_id)
+                result["answer"] = gr.redact(result["answer"])  # ⑤ 输出护栏：PII 脱敏
                 store.append_message(session_id, "assistant", result["answer"])
                 result["session_id"] = session_id
-                dt = (time.perf_counter() - t0) * 1000
-                log.info("[%s] 响应 | code=200 | route=%s | 耗时=%.0fms", req_id, result["route"], dt)
+                get_semantic_cache().put(question, result["answer"], has_pii)  # ④ 回填语义缓存
+                audit("chat", trace_id=req_id, user_id=user_id, ip=ip, session_id=session_id,
+                      route=result["route"], model=result["model"], latency_ms=result["latency_ms"])
                 self._send(200, result, trace_id=result["trace_id"])
             except Exception as e:
                 dt = (time.perf_counter() - t0) * 1000
                 log.error("[%s] 处理异常 | code=500 | 耗时=%.0fms | %s", req_id, dt, e)
-                self._send(500, {"error": str(e), "trace_id": req_id})
+                self._send(500, error_payload(str(e), req_id, 500), trace_id=req_id)
             return
 
         # 知识库：上传
@@ -369,9 +454,14 @@ class Handler(BaseHTTPRequestHandler):
         # /api/sessions/{id}
         if len(parts) == 3 and parts[0] == "api" and parts[1] == "sessions":
             sid = unquote(parts[2])
-            if not get_session_store().delete_session(sid):
+            user_id = resolve_user(self.headers, self.client_address[0])
+            sess = get_session_store().get_session(sid)
+            if sess is None or (sess.get("owner") and sess.get("owner") != user_id):
                 self._send(404, {"error": f"会话不存在：{sid}"})
                 return
+            get_session_store().delete_session(sid)
+            self._send(200, {"status": "ok", "action": "delete", "session_id": sid})
+            return
             self._send(200, {"status": "ok", "action": "delete", "session_id": sid})
             return
         # /api/kb/{id}
