@@ -1,20 +1,65 @@
 # 社区矛盾调解 RAG 助手
 
-面向基层社区治理的 **Agentic RAG** 应用：把矛盾调解知识（邻里噪音、漏水、停车、物业、赡养、家暴等）接入检索增强生成，让调解员和居民在描述纠纷时，快速获得**有依据、可追溯、不编造**的处置建议、相关法条与调解步骤。
+> 把社区调解知识接入检索增强生成（RAG），让调解员和居民在描述纠纷时，几秒内拿到**可溯源、不编造**的处置建议、法条与调解步骤。
+>
+> 答案的每一句都能对应到知识库来源；知识库里没有的，就诚实说“没有”，绝不凭空编法条。
 
-> 场景痛点：社区矛盾类型多、法条分散、新人上手慢。传统"搜文档"效率低，通用聊天机器人又容易凭空编造法条。本项目用 RAG + 智能路由 + 自纠错，让答案**每一句都来自知识库、每一条都能溯源**。
+---
+
+## 三分钟看价值
+
+| 你担心的痛点 | 本项目怎么解 |
+| --- | --- |
+| 通用聊天机器人乱编法条 | **Self-RAG 自纠错 + 严格接地提示词**：检索不达标自动改写重试；仍无依据就诚实拒答 |
+| 复杂纠纷一句话说不清 | **查询分解**：自动把“责任 + 举证 + 赔偿 + 程序”拆成子问题分别检索再合并 |
+| 专有名词 / 法条召回不全 | **混合检索**：稠密向量 + BM25 稀疏，RRF 融合后再重排 |
+| 多人共用稳定、安全 | **网关层**：限流 / 多用户隔离 / PII 脱敏/ 防Prompt 注入 / 审计 / 弹性降级 / 语义缓存 |
+| 想换模型、做横评 | **三模型同管道**：DeepSeek / 智谱 GLM / 通义千问一键切换，RAGAS 四指标横评已跑通 |
+| 不想装一堆依赖 | **零依赖可跑**：标准库 + `httpx`，不填 Key 也能 mock 模式冒烟；要持久化 / 生产再上 Qdrant / FastAPI等 |
+
+---
+
+## 马上跑起来（3 步）
+
+```bash
+# 后端：克隆后直接起，不填 Key 也能跑（mock 模式，验证逻辑）
+cd backend && pip install httpx && python -m app.main
+# 访问 http://localhost:8000/api/health
+
+# 前端
+cd frontend && npm install && npm run dev
+# 访问 http://localhost:5173
+```
+
+填 Key（DeepSeek / 智谱 / 通义任一，见 `.env.example`）即切换真实模型，无需改代码。
+
+---
 
 ## 核心能力
 
-1. **Supervisor 智能路由**：先判断问题类型——问候/能力问答直接回答，信息过少则引导补充，只有真正需要时才走检索，省 token 也更准。
-2. **Self-RAG 自纠错**：检索质量不达标时自动改写查询重试；多次仍无相关依据则**诚实告知"知识库暂无依据"**，绝不编造法条。
-3. **多模型可切换横评**：同一套 RAG 管道，可在 DeepSeek / 智谱 GLM / 通义千问之间一键切换，为后续做 faithfulness、延迟、成本的横向对比打底。
-4. **引用溯源**：每条答复附带来源卡片（标题、类型、相关度、内容摘要、法条原文），便于人工复核。
-5. **流式回答（SSE）**：首字即显，回答边生成边返回，长文本不再"转圈"等待。
-6. **多用户会话隔离**：每个用户（前端自生成 `user_id`）的会话相互独立、跨用户不可见，为多人共用与在线部署打底。
-7. **限流防滥用**：按"用户 + IP + 全局"三维限流，恶意刷对话、挤占算力会被 `429` 拦截，保证服务稳定。
-8. **护栏与审计（合规刚需）**：输入拦截 prompt 注入攻击；输出自动做 **PII 脱敏**（手机号/身份证/邮箱掩码）；每次请求留痕审计日志。
-9. **弹性降级 + 语义缓存**：模型调用带超时、瞬时失败重试、故障率超阈值自动熔断并**切换备用模型**；相同 / 近似问题命中语义缓存直接返回，省 token、降延迟。
+- **智能路由**：问候等直接回；信息太少引导补充；只有真正需要才检索——省token且更准。
+- **Self-RAG 自纠错**：检索质量不达标自动改写查询重试；多次仍无相关依据 → 诚实告知“知识库暂无依据”，不编造。
+- **查询分解（Query Decomposition）**：复杂问题可拆解（长句 / 多问号 / 并列诉求等）自动拆 2–4 个子问题分别检索合并，前端展示拆分链路。
+- **混合检索 + 重排**：稠密向量 + BM25 稀疏 → RRF 融合 → 重排精排（默认向量 + 中文词面混合，预留 bge 跨编码器精排）。
+- **多角色视角**：居民 / 物业 / 调解员 / 网格员四种身份，答案视角自动切换（把“调解员要做的事”转成对应用户的可执行动作）。
+- **引用溯源**：每条答复附来源（标题、类型、相关度、摘要、法条原文），便于人工复核。
+- **知识库后台**：可完成“上传 → 草稿 → 发布 / 下架 / 删除”，先审后上。
+- **长期记忆**：跨多轮沉淀结构化案件档案。
+
+---
+
+## 工程化（网关层，生产可用）
+
+全部零额外依赖、可在 `backend/app/config.py` 一键开关：
+
+- **多用户会话隔离**：按 `user_id` 命名空间隔离，跨用户不可见。
+- **三维限流**：用户 / IP / 全局令牌桶，超限 `429 + Retry-After`；Redis 可用则持久化，否则内存兜底。
+- **护栏**：输入拦截 prompt 注入；输出自动 **PII 脱敏**（手机 / 身份证 / 邮箱掩码。
+- **审计**：每次问答留痕（user / ip / 模型 / 耗时 / 缓存命中）。
+- **弹性降级**：LLM 超时 + 指数退避重试 + 故障率超阈值熔断并切备用模型（DeepSeek → 智谱 → 通义），防雪崩。
+- **语义缓存**：近似问题（余弦 ≥ 0.92）直接返回历史答案，省调用、降延迟。
+
+---
 
 ## 架构
 
@@ -22,14 +67,15 @@
 ┌────────────┐                 ┌──────── 网关层（请求必经）─────────┐
 │  Vue 3 前端 │ ──/api/chat──▶ │ 限流 → 多用户隔离 → 护栏 → 语义缓存 │
 │ (Vite)     │ ◀───────────── │ 放行后入服务；输出再做 PII 脱敏+审计 │
-└────────────┘    JSON 答复    └────────────────┬──────────────────┘
+└────────────┘    SSE 流式答复  └────────────────┬──────────────────┘
                                                  ▼
                                   ┌───────────────────────────┐
-                                  │  FastAPI / http.server 服务 │
+                                  │  http.server / FastAPI 服务 │
                                   │  ┌─────────────────────┐  │
                                   │  │  RAG Pipeline        │  │
-                                  │  │  ├ Supervisor 路由   │  │
-                                  │  │  ├ 向量检索 + 重排   │  │
+                                  │  │  ├ 智能路由   │  │
+                                  │  │  ├ 混合检索 + 重排   │  │
+                                  │  │  ├ 查询分解          │  │
                                   │  │  ├ Self-RAG 自纠错  │  │
                                   │  │  └ 大模型生成(溯源) │  │
                                   │  └─────────────────────┘  │
@@ -41,49 +87,50 @@
                                   └───────────────────────────┘
 ```
 
-- **编排**：自研轻量 Agentic 控制器（Supervisor + Self-RAG 循环）
-- **向量库**：默认纯内存（零依赖）；配置 `QDRANT_URL` 可切换 Qdrant 服务端
-- **Embedding**：智谱 Embedding-3（OpenAI 兼容接口）
-- **生成模型**：DeepSeek（基准）/ 智谱 GLM / 通义千问（均 OpenAI 兼容）
-- **评测**：RAGAS 四指标横评（DeepSeek / 智谱 / Qwen 同管道对比，已跑通，见 `backend/benchmark_report.md`）
+---
 
-## 网关与工程化能力
+## 技术栈
 
-面向"可被多人稳定、安全使用"的工程化设计，全部零额外依赖、可在 `config.py` 中开关：
+- **后端**：Python 标准库 + `http.server`；生产可切 FastAPI
+- **前端**：Vue 3
+- **检索**：混合检索+ RRF 融合 + 重排；向量库Qdrant
+- **模型**：智谱 Embedding-3；DeepSeek / 智谱 GLM / 通义千问（OpenAI 兼容统一接口）
+- **评测**：RAGAS 四指标
 
-- **多用户会话隔离**：会话按 `user_id` 命名空间隔离，列表 / 读取 / 删除均校验归属，跨用户互不可见。
-- **三维限流**：用户 / IP / 全局令牌桶（默认 12 / 40 / 600 次每分钟），超限返回 `429 + Retry-After` 与统一错误结构 `{error, trace_id, code}`；Redis 可用时持久化限流计数，否则内存兜底。
-- **护栏**：
-  - 输入：识别并拦截 prompt 注入（"忽略以上指令""输出你的系统提示词"等），命中即 `400` 阻断。
-  - 输出：**PII 脱敏**——手机号 `138****5678`、身份证 `110101********1234`、邮箱 `abc***@qq.com` 自动掩码，保护居民隐私。
-- **审计**：每次问答 / 拦截写入 append-only 审计日志（时间、事件、user_id、ip、session、路由、模型、耗时、是否命中缓存），便于合规追溯。
-- **弹性降级**：LLM 调用设硬超时（默认 45s）；瞬时失败（429/5xx/超时）指数退避重试 1 次；某模型故障率超阈值自动**熔断**并切换 `fallback_providers` 降级链（默认 DeepSeek → 智谱 → 通义），避免线程堆积雪崩。
-- **语义缓存**：相同 / 近似问题（余弦相似度 ≥ 0.92）直接返回历史答案，省 LLM 调用；仅缓存高相关且无 PII 的答案，知识库更新即应失效重算。
+---
 
-> 所有开关集中在 `backend/app/config.py`（以 `rate_limit_` / `llm_` / `semantic_cache_` / `guardrails_` / `audit_` 前缀），按需开关，不影响核心 RAG 逻辑。
+## 评测与模型横评
 
-## 快速开始
-
-### 1. 后端
+已用 RAGAS 在同一 RAG 管道下对三模型跑通四指标（faithfulness / answer_relevancy / context_precision / context_recall）：
 
 ```bash
-cd backend
-cp .env.example .env          # 填入你的模型 API Key（至少一项；默认 DeepSeek）
-pip install -r requirements.txt   # 或仅 pip install httpx
-python -m app.main             # 启动后访问 http://localhost:8000/api/health
+python tests/heuristic_eval.py --provider all    
+PYTHONPATH=. python tests/run_ragas.py --provider all   # RAGAS 四指标横评
 ```
 
-不填任何 Key 也能跑：自动进入 **mock 模式**，管道逻辑全链路可验证（答案由模板生成，仅用于冒烟）。
+结论：三模型要点覆盖率均 100%、拒答均正确；质量差距很小，**DeepSeek 性价比最高**（相关度精度高且延迟低）。
+当前最大短板是**忠实度（faithfulness，约 0.35–0.4）**——部分答案偶有超出知识库表述，已在优化生成提示词与扩充语料。
 
-### 2. 前端
+---
 
-```bash
-cd frontend
-npm install
-npm run dev                   # 访问 http://localhost:5173
-```
+## 优化路线图（已知短板 → 计划）
 
-前端开发服务器已配置 `/api` 代理到后端 `:8000`，开箱即用。
+- **提升回答忠实度**：扩充语料 + 提示词收紧 + 引入自校验。
+- **重排升级**：接入 `bge-reranker-v2-m3` 跨编码器精排（`rerank.py` 已预留 `mode="bge"`）。
+- **检索增强**：查询改写（同义扩展）、时间 / 地域感知过滤。
+- **网关补强**：正式认证（JWT）、Langfuse追踪接入。
+- **优化架构**：通过MCP协议接入各种工具，实现多模型路由，引入ReAct架构。
+- **提升成多Agent**：用LangGraph 把"查法条/生成调解方案/建工单/转人工"做成工具,让 LLM 自主调度。
+---
+
+## 功能展望（还能加什么）
+
+- **多租户 / 多社区隔离**：按社区、按街道分发知识库。
+- **语音 / 微信小程序入口**：方便居民现场口述。
+- **知识库自动质检**：来源冲突检测、过期法条预警。
+- **多语言 / 方言适配**：面向老年居民。
+- **管理看板**：用量、faithfulness 趋势、热点纠纷类型可视化。
+---
 
 ## 目录结构
 
@@ -91,150 +138,21 @@ npm run dev                   # 访问 http://localhost:5173
 .
 ├── backend/
 │   ├── app/
-│   │   ├── config.py         # 配置（模型/向量库/检索参数，全部走环境变量）
-│   │   ├── main.py           # 零依赖 HTTP 服务入口（生产可换 FastAPI 版）
-│   │   ├── ingest/           # 入库管道：文件解析 → 切分 → 向量化 → 增量 upsert
-│   │   │   ├── loaders.py    # PDF/Word/MD/TXT 加载（OCR 钩子，懒加载）
-│   │   ├── kb/               # 知识库后台：文档生命周期（草稿→发布→下架→删除）
-│   │   │   └── __init__.py   # KBManager：以 corpus/docs + corpus/uploads 文件为数据源
-│   │   │   ├── split.py      # 中文友好切分（段落/句子 + 重叠）
-│   │   │   ├── pipeline.py   # 编排 + 按 doc_id 增量去重
-│   │   │   ├── gen_sample_corpus.py  # 生成 160 篇演示语料（写入 corpus/docs/）
-│   │   │   └── __main__.py   # CLI：python -m app.ingest
-│   │   ├── rag/
-│   │   │   ├── embeddings.py # 向量化（智谱 API，含 mock 降级 + 自动分批）
-│   │   │   ├── llm.py        # 大模型调用（DeepSeek/智谱/Qwen 统一接口）
-│   │   │   ├── vectorstore.py# 向量库（内存 / 可选 Qdrant，含零依赖 REST 兜底）
-│   │   │   ├── rerank.py     # 重排序（向量+词面混合，可升级 bge）
-│   │   │   └── pipeline.py   # 核心：Supervisor 路由 + Self-RAG 自纠错（BM25 从向量库 payload 重建）
-│   │   └── data/
-│   │       ├── mediation_cases.json  # 48 篇种子案例（评测用；种子知识库已文件化为 corpus/docs/seeds/）
-│   │       ├── kb_index.json         # 轻量索引：仅存元信息（id/状态/路径/分块数），不含正文
-│   │       └── ingest.py             # 旧版入库脚本（保留兼容；新架构以文件为数据源）
-│   ├── corpus/
-│   │   ├── docs/            # 知识库语料目录（16 类演示语料 + seeds/ 48 篇种子，可替换为自有文档）
-│   │   └── uploads/         # 用户上传 / 导入的文件（默认草稿，审核后发布）
-│   └── tests/                # 冒烟 / 评测 / RAGAS 横评脚本
-└── frontend/                 # Vue 3 + Vite 聊天界面
+│   │   ├── config.py         # 全部配置（模型/向量库/网关/检索，走环境变量）
+│   │   ├── main.py           # 服务入口
+│   │   ├── gateway.py        # 限流 / 隔离 / 护栏 / 语义缓存 / 审计
+│   │   ├── ingest/           # 入库管道：解析 → 切分 → 向量化 → 增量 upsert
+│   │   ├── kb/               # 知识库后台
+│   │   ├── rag/              # embeddings / llm / vectorstore / rerank / hybrid / pipeline
+│   │   ├── profile_store.py  # 长期记忆：结构化案件档案
+│   │   └── session_store.py  # 多轮会话存储
+│   ├── corpus/               # 知识库语料
+│   └── tests/                # RAGAS 脚本
+└── frontend/                 # Vue 3
 ```
 
-## 评测与横向对比
+---
 
-已用 RAGAS 在同一 RAG 管道下对 **DeepSeek / 智谱 GLM / 通义千问** 做四指标横评（faithfulness / answer_relevancy / context_precision / context_recall），报告见 [`backend/benchmark_report.md`](backend/benchmark_report.md)。
+## 许可
 
-- 轻量启发式横评（要点覆盖 / 来源准确 / 拒答正确 / 延迟）：`python tests/heuristic_eval.py --provider all`
-- RAGAS 权威四指标（本机跑，详见报告）：`PYTHONPATH=. python tests/run_ragas.py --provider all`
-
-> 评测结论：三模型要点覆盖率均 100%、拒答均正确；质量差距很小，**DeepSeek 性价比最高**（相关度精度最高且延迟最低）。当前最大短板是 faithfulness（答案偶有超出知识库的表述），已在优化生成 prompt 与扩充语料（见下）。
-
-## 调试与可观测性
-
-每个请求都附带可追踪信息，方便定位问题与优化：
-
-- **结构化日志**：后端使用标准库 `logging`，控制台 + `backend/logs/app.log`（滚动 5MB×3）双输出，按 `LOG_LEVEL`（默认 `info`，可设 `debug`）分级。
-- **请求级 Trace**：每次 `/api/chat` 返回 `trace_id` 与分阶段耗时 `trace.steps`（路由 / 向量检索 / 重排 / 大模型生成），并写入响应头 `X-Trace-Id`。前端在每条回答下展开「🔍 检索链路」面板即可看到完整时间线。
-- **诚实可观测**：路由判定、检索最佳相关度、Self-RAG 重试次数、来源召回情况均会记入日志与接口返回，便于复现与评测。
-- **审计留痕**：网关层每次请求（问答 / 注入拦截）写入 `AUDIT` 结构化日志（user_id / ip / session / 路由 / 模型 / 耗时 / 缓存命中），搜索 `AUDIT` 即可追溯。
-
-```bash
-tail -f backend/logs/app.log     # 实时跟踪后端运行
-```
-
-> 生产环境如需更专业的 LLM 调用追踪（token、成本、对话回放），可接入 Langfuse / LangSmith / OpenTelemetry，本项目已在 `llm.py` 与 `pipeline.py` 预留日志埋点，接入成本低。
-
-## 入库管道（生产数据层）
-
-演示用的 48 篇样例是手写 JSON。生产环境需要把真实文档（政策 PDF、案例 Word、扫描件等）**持续入库**。`app/ingest/` 解决这件事，且与业务场景解耦——换场景只换语料目录，管道代码不用改。
-
-### 1) 准备语料
-
-```bash
-cd backend
-# 生成 160 篇演示语料（16 类矛盾，每类 10 篇）到 corpus/raw/
-PYTHONPATH=. python -m app.ingest.gen_sample_corpus
-```
-
-你也可以直接把单位的 **PDF / Word / Markdown / 文本** 丢进 `corpus/raw/` 任意子目录，无需改代码。
-
-### 2) 入库
-
-```bash
-# 增量入库：按 doc_id 去重，重跑只补新文档，不重复烧 embedding
-PYTHONPATH=. python -m app.ingest
-
-# 全量重建（先清空向量库与索引）
-PYTHONPATH=. python -m app.ingest --reset
-
-# 多租户隔离（预留，向量库按 payload.tenant_id 过滤即可）
-PYTHONPATH=. python -m app.ingest --tenant-id acme
-```
-
-- 支持的格式：`.md / .txt / .json / .pdf / .docx`。PDF / Word 解析依赖 `pip install pypdf python-docx`；扫描件（图片型 PDF）另需 `paddleocr pdf2image` 或配置外部 OCR 服务。
-- 入库后**重启后端服务**即生效：BM25 稀疏索引在服务启动时从统一检索源（种子 + 文件语料）自动重建，混合检索即可命中新文档。
-- 服务端启动时会自动把 `corpus/raw/` 增量灌入，所以克隆仓库后直接 `python -m app.main` 也能用。
-
-> **两条入库入口的区别**
-> - `python -m app.ingest`：把 `corpus/raw/` 下的**文件文档**解析入库（写入 `ingested.jsonl`，若已配 `QDRANT_URL` 则同步 upsert）。用于日常「新增/更新语料」。
-> - `python -m app.data.ingest`（或启动服务端）：加载 **48 条种子案例 + `ingested.jsonl` 全部文件语料**，一次性重建完整知识库并 upsert 到向量库。用于「首次全量灌库 / 换向量库后重建」。
-
-### 3) 本地向量库（Qdrant，免费）
-
-默认是纯内存向量库，重启需重新入库。需要**持久化**时，起一个本地 Qdrant（Windows 原生程序 / Docker 均可，完全免费、架构与云端同构）：
-
-```bash
-# 方式 A：Docker
-docker compose up -d
-# 方式 B：Windows 原生 Qdrant
-#   下载 qdrant.exe 直接运行即可（默认暴露 :6333）
-
-# 然后在 backend/.env 中设置（二者相同）：
-QDRANT_URL=http://localhost:6333
-```
-
-配置后**无需改代码**，入库与检索自动走 Qdrant，重启不丢数据。几点说明：
-
-- **无需安装 `qdrant-client`**：若环境没装该包，代码会自动回退到零依赖的 **REST 适配**（`vectorstore.QdrantRestStore`，基于 `httpx`），功能完全一致。
-- **首次全量灌库**：设好 `QDRANT_URL` 后，跑一次完整知识库构建即可把 48 种子 + 全部文件语料写进 Qdrant：
-
-  ```bash
-  cd backend
-  PYTHONPATH=. python -m app.data.ingest        # 加载 48 种子 + ingested.jsonl，全量 upsert
-  # 等价于启动服务端时自动执行的那一步；此后检索都走 Qdrant
-  ```
-
-- 托管云（Qdrant Cloud / Zilliz）只在你要**公网多人在线访问**时才需要——本地演示不必花钱。
-
-### 4) 多场景 / 多租户
-
-- **多场景**：入库管道场景无关。新增场景只需把对应文档放入 `corpus/raw/<场景名>/` 子目录并重跑入库，零额外开发。
-- **多用户（已实现）**：会话层已按 `user_id` 隔离（列表 / 读取 / 删除校验归属）；如需更强租户隔离，可在向量库 payload 加 `tenant_id` 做 namespace 隔离。
-
-## 知识库后台（可视化运营）
-
-除命令行入库外，项目内置一个**知识库后台**，可在浏览器里完成「上传 → 审核 → 发布 / 下架 / 删除」的完整生命周期管理，无需碰命令行。前端「对话 / 知识库」一键切换即可。
-
-**能力**
-- **统计看板**：文档总数 / 已发布 / 草稿 / 知识分块数，指标一目了然。
-- **上传文档**：MD / TXT / PDF / Word 直接上传，落盘后先成为**草稿**，不进检索。
-- **发布 / 下架 / 删除**：发布才嵌入向量库并进入检索；下架立即从向量库移除；删除连同源文件一并清理。所有操作实时同步 BM25 稀疏索引。
-- **草稿态审核**：只有 `published` 的文档参与检索与回答，保证「先审后上」，避免错误资料直接暴露给用户。
-
-**实现要点**
-- 单一事实来源是 `backend/data/kb_manifest.jsonl`（文档级 manifest，记录元信息 / 分块 / 状态 / 来源路径）；已发布文档才进入向量库 + BM25。
-- 每个分块 payload 携带 `doc_id`，支持按文档整体上下架（`vectorstore.delete_by_doc_id`），无需逐块操作。
-- 首次启动 `KBManager.ensure()` 会自动把 **48 条种子案例 + `corpus/raw/` 全部文件语料** 迁移进 manifest 并置为已发布，克隆仓库即可用。
-
-**接口**（零依赖 `http.server` 已内置，生产切换 FastAPI 接口一致）
-
-```
-GET  /api/kb/stats                  知识库统计
-GET  /api/kb/docs?status=&page=     文档列表（支持按状态筛选）
-POST /api/kb/upload                  上传文档（base64 JSON）-> 草稿
-POST /api/kb/{id}/publish            发布（嵌入 + 入向量库 + 重建 BM25）
-POST /api/kb/{id}/unpublish          下架（从向量库移除）
-DELETE /api/kb/{id}                  删除（含物理文件）
-```
-
-## 说明
-
-当前仓库可在**零额外依赖**下运行（仅标准库 + `httpx`）。如希望使用 Qdrant 向量库或 FastAPI 生产栈，按 `requirements.txt` 安装对应包并在 `config` / 入口处切换即可，核心逻辑无需改动。
+MIT（见 `LICENSE`）。

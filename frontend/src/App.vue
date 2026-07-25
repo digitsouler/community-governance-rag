@@ -98,6 +98,43 @@ onMounted(async () => {
   await refreshSessions()
 })
 
+// 点击消息锚点：滚动定位 + 更新 URL hash（WorkBuddy 式深链定位）
+function locateMsg(i) {
+  const el = document.getElementById('msg-' + i)
+  if (!el) return
+  el.scrollIntoView({ behavior: 'smooth', block: 'center' })
+  history.replaceState(null, '', '#msg-' + i)
+  el.classList.remove('msg-flash')
+  // 触发重排以重启动画
+  void el.offsetWidth
+  el.classList.add('msg-flash')
+  setTimeout(() => el.classList.remove('msg-flash'), 1300)
+}
+
+// ---------- 本会话提问下拉（WorkBuddy 式：右上角按钮 → 列出用户提问 → 跳转） ----------
+const showHistoryMenu = ref(false)
+function toggleHistoryMenu() {
+  showHistoryMenu.value = !showHistoryMenu.value
+}
+function closeHistoryMenu() { showHistoryMenu.value = false }
+// 点击外部/按 Esc 关闭
+document.addEventListener('click', closeHistoryMenu)
+document.addEventListener('keydown', e => { if (e.key === 'Escape') closeHistoryMenu() })
+
+const userQuestions = computed(() => {
+  return messages.value
+    .map((m, i) => ({ m, i }))
+    .filter(x => x.m.role === 'user' && x.m.content)
+    .map(x => {
+      const t = (x.m.content || '').replace(/\s+/g, ' ').trim()
+      return { i: x.i, text: t, preview: t.length > 14 ? t.slice(0, 14) + '…' : t }
+    })
+})
+function jumpToUserQuestion(i) {
+  closeHistoryMenu()
+  locateMsg(i)
+}
+
 async function send(text) {
   const question = (text ?? input.value).trim()
   if (!question || loading.value) return
@@ -551,6 +588,27 @@ function kbGoPage(delta) {
             <button :class="['tab', { active: tab === 'chat' }]" @click="switchTab('chat')">对话</button>
             <button :class="['tab', { active: tab === 'kb' }]" @click="switchTab('kb')">知识库</button>
           </nav>
+          <div class="history-menu" v-if="tab === 'chat'">
+            <button class="history-btn" :class="{ active: showHistoryMenu }"
+                    @click="toggleHistoryMenu" :title="`本会话提问（${userQuestions.length}）`">
+              📋 本会话提问 <span class="badge-count" v-if="userQuestions.length">{{ userQuestions.length }}</span>
+              <span class="caret" :class="{ open: showHistoryMenu }">▾</span>
+            </button>
+            <div class="history-dropdown" v-if="showHistoryMenu" @click.stop>
+              <div class="history-dropdown-head">
+                <span>本会话用户提问（{{ userQuestions.length }}）</span>
+                <button class="history-close" @click="showHistoryMenu = false" title="关闭">×</button>
+              </div>
+              <div class="history-list" v-if="userQuestions.length">
+                <button v-for="q in userQuestions" :key="q.i"
+                        class="history-item" @click="jumpToUserQuestion(q.i)">
+                  <span class="history-idx">#{{ q.i + 1 }}</span>
+                  <span class="history-text" :title="q.text">{{ q.preview }}</span>
+                </button>
+              </div>
+              <div class="history-empty" v-else>本会话还没有提问</div>
+            </div>
+          </div>
           <select class="model-select" v-model="currentModel" v-if="tab === 'chat'">
             <option v-for="m in models" :key="m.provider" :value="m.provider">
               {{ m.label }}（{{ m.model }}）{{ m.available ? '' : '· 未配置key' }}
@@ -612,9 +670,10 @@ function kbGoPage(delta) {
         </template>
       </div>
 
-      <div v-for="(m, i) in messages" :key="i" class="msg" :class="m.role">
+      <div v-for="(m, i) in messages" :key="i" class="msg" :class="m.role" :id="'msg-' + i">
         <div class="avatar">{{ m.role === 'user' ? '我' : 'AI' }}</div>
         <div class="bubble">
+          <button class="msg-anchor" :title="'点击定位此条 #' + (i + 1)" @click="locateMsg(i)">#{{ i + 1 }}</button>
           <div v-if="m.role === 'bot' && m.route" class="route-tag">
             {{ routeLabel[m.route] || m.route }} · 模型 {{ m.model }}
             <span v-if="m.retries"> · 自纠错重试 {{ m.retries }} 次</span>
@@ -762,6 +821,96 @@ function kbGoPage(delta) {
 </template>
 
 <style scoped>
+.msg {
+  position: relative;
+}
+.msg-anchor {
+  position: absolute;
+  top: 8px;
+  right: 10px;
+  z-index: 2;
+  min-width: 26px;
+  height: 22px;
+  padding: 0 6px;
+  border: 1px solid #e2e8f0;
+  border-radius: 6px;
+  background: #fff;
+  color: #94a3b8;
+  font-size: 12px;
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  line-height: 20px;
+  cursor: pointer;
+  opacity: 0;
+  transition: opacity 0.15s ease, color 0.15s ease, border-color 0.15s ease;
+}
+.msg:hover .msg-anchor {
+  opacity: 1;
+}
+.msg-anchor:hover {
+  color: #2563eb;
+  border-color: #2563eb;
+}
+.msg-flash {
+  animation: msgFlash 1.3s ease;
+}
+@keyframes msgFlash {
+  0%   { box-shadow: 0 0 0 0 rgba(37, 99, 235, 0); }
+  20%  { box-shadow: 0 0 0 3px rgba(37, 99, 235, 0.35); }
+  100% { box-shadow: 0 0 0 0 rgba(37, 99, 235, 0); }
+}
+
+/* ---------- 头部：本会话提问下拉 ---------- */
+.history-menu { position: relative; }
+.history-btn {
+  display: inline-flex; align-items: center; gap: 6px;
+  padding: 6px 12px; border: 1px solid #d6dde6; border-radius: 8px;
+  background: #fff; color: #2d3748; font-size: 13px; cursor: pointer;
+  transition: all 0.15s;
+}
+.history-btn:hover { border-color: #5a7ad8; color: #2c5282; }
+.history-btn.active { border-color: #5a7ad8; background: #eef3ff; color: #2c5282; }
+.badge-count {
+  display: inline-block; min-width: 18px; padding: 0 5px; line-height: 16px;
+  background: #5a7ad8; color: #fff; border-radius: 9px; font-size: 11px; text-align: center;
+}
+.caret { font-size: 10px; color: #718096; transition: transform 0.15s; }
+.caret.open { transform: rotate(180deg); }
+
+.history-dropdown {
+  position: absolute; top: calc(100% + 6px); right: 0; width: 320px;
+  background: #fff; border: 1px solid #e2e8f0; border-radius: 10px;
+  box-shadow: 0 8px 28px rgba(0,0,0,0.12); z-index: 1000;
+  max-height: 70vh; display: flex; flex-direction: column; overflow: hidden;
+}
+.history-dropdown-head {
+  display: flex; justify-content: space-between; align-items: center;
+  padding: 10px 14px; border-bottom: 1px solid #edf2f7;
+  font-size: 12px; color: #4a5568; font-weight: 600;
+}
+.history-close {
+  background: transparent; border: none; cursor: pointer;
+  font-size: 18px; color: #a0aec0; line-height: 1; padding: 0 4px;
+}
+.history-close:hover { color: #2d3748; }
+.history-list { overflow-y: auto; padding: 4px 0; }
+.history-item {
+  display: flex; align-items: center; gap: 8px; width: 100%;
+  padding: 8px 14px; background: transparent; border: none; cursor: pointer;
+  text-align: left; font-size: 13px; color: #2d3748;
+  transition: background 0.12s;
+}
+.history-item:hover { background: #f7fafc; }
+.history-idx {
+  flex-shrink: 0; min-width: 32px; font-size: 11px; color: #718096;
+  font-family: ui-monospace, SFMono-Regular, monospace;
+}
+.history-text {
+  flex: 1; overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+}
+.history-empty {
+  padding: 24px 14px; text-align: center; color: #a0aec0; font-size: 13px;
+}
+
 .trace {
   margin-top: 10px;
   border: 1px solid #e3e8ef;
