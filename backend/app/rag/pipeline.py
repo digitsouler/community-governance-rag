@@ -17,7 +17,6 @@ from typing import Any
 
 from app.config import ProviderName, Settings, get_settings
 from app.log import get_logger
-from app.experience_store import get_experience_store
 from app.profile_store import get_profile_store
 from app.rag.embeddings import EmbeddingClient
 from app.rag.hybrid import BM25Index, rrf_fuse
@@ -72,8 +71,6 @@ class RAGPipeline:
             self.bm25._built = False
         # 长期记忆（P1）：结构化案件档案存储（Redis 优先，内存降级）
         self._profiles = get_profile_store()
-        # 长期记忆（P3）：跨会话经验向量库（Qdrant 优先，内存降级）
-        self._exp = get_experience_store()
 
     def rebuild_bm25(self):
         """用向量库当前全部 payload 重建稀疏索引，使其与检索源完全一致。
@@ -175,27 +172,38 @@ class RAGPipeline:
         return q.strip() or query
 
     # ---------- 对外接口 ----------
-    def query(
-        self,
-        question: str,
-        provider: ProviderName | None = None,
-        history: list[dict] | None = None,
-        session_id: str | None = None,
-    ) -> dict[str, Any]:
+    def query(self, question, provider=None, history=None, session_id=None, stream=False):
+        """统一入口。
+
+        stream=False → 返回完整结果 dict（兼容旧调用 / 评测脚本）；
+        stream=True  → 返回生成器，逐条 yield SSE 事件
+                      {"type": "route"|"delta"|"done"|"error", ...}。
+        """
+        gen = self._run(question, provider, history, session_id)
+        if stream:
+            return gen
+        final = None
+        for ev in gen:
+            if ev.get("type") == "done":
+                final = ev["result"]
+        return final
+
+    def _run(self, question, provider, history, session_id):
+        """内部生成器：逐步执行管道并 yield 事件，供流式输出复用。"""
+        import random
         trace_id = uuid.uuid4().hex[:12]
         provider = provider or self.s.default_llm
         steps: list[dict[str, Any]] = []
         t_total = time.perf_counter()
-        # 多轮对话：规整历史（只保留最近若干轮 user/assistant 文本）
         history = self._normalize_history(history)
 
-        def mark(stage: str, detail: str = "", start: float | None = None):
+        def mark(stage, detail="", start=None):
             ms = (time.perf_counter() - start) * 1000 if start else None
             steps.append({"stage": stage, "detail": detail, "ms": round(ms, 1) if ms is not None else None})
 
         log.info("[%s] 新请求 | provider=%s | q=%r", trace_id, provider, question[:60])
 
-        # v6：纯感谢/客套消息短路——在路由之前拦截，不走 LLM
+        # 纯感谢/客套消息短路——在路由之前拦截，不走 LLM（省 token、快、100% 可控）
         _GRATITUDE_KW = ["谢谢", "感谢", "真好", "太好了", "有用", "有帮助",
                          "不错", "厉害", "给力", "棒", "辛苦了"]
         _NOT_PURE = ["但是", "不过", "可是", "还有个", "另外", "接下来", "然后"]
@@ -205,7 +213,6 @@ class RAGPipeline:
             and not any(x in question for x in _NOT_PURE)
         )
         if is_pure_thanks:
-            import random
             replies = [
                 "不客气，有需要随时问。",
                 "能帮到你就好，有问题再找我。",
@@ -213,8 +220,11 @@ class RAGPipeline:
                 "应该的，有问题随时说。",
             ]
             mark("supervise", "route=gratitude-shortcut")
-            return self._wrap(trace_id, steps, t_total, "direct",
-                              random.choice(replies), [], 0, provider)
+            yield {"type": "route", "route": "direct", "trace_id": trace_id, "session_id": session_id}
+            wrapped = self._wrap(trace_id, steps, t_total, "direct", random.choice(replies), [], 0, provider)
+            wrapped["session_id"] = session_id
+            yield {"type": "done", "result": wrapped}
+            return
 
         # Supervisor 路由（有历史时，短追答不再误判为 clarify）
         t = time.perf_counter()
@@ -223,45 +233,39 @@ class RAGPipeline:
         log.info("[%s] 路由判定=%s | 历史轮数=%d", trace_id, route, len(history))
 
         if route == "direct":
-            return self._wrap(trace_id, steps, t_total, "direct", self._direct_answer(), [], 0, provider)
+            yield {"type": "route", "route": "direct", "trace_id": trace_id, "session_id": session_id}
+            wrapped = self._wrap(trace_id, steps, t_total, "direct", self._direct_answer(), [], 0, provider)
+            wrapped["session_id"] = session_id
+            yield {"type": "done", "result": wrapped}
+            return
         if route == "clarify":
-            return self._wrap(trace_id, steps, t_total, "clarify", self._clarify(), [], 0, provider)
+            yield {"type": "route", "route": "clarify", "trace_id": trace_id, "session_id": session_id}
+            wrapped = self._wrap(trace_id, steps, t_total, "clarify", self._clarify(), [], 0, provider)
+            wrapped["session_id"] = session_id
+            yield {"type": "done", "result": wrapped}
+            return
         if route == "out_of_domain":
             log.info("[%s] 超出服务范围，直接回复（不检索）", trace_id)
-            return self._wrap(trace_id, steps, t_total, "out_of_domain", self._out_of_domain(), [], 0, provider)
+            yield {"type": "route", "route": "out_of_domain", "trace_id": trace_id, "session_id": session_id}
+            wrapped = self._wrap(trace_id, steps, t_total, "out_of_domain", self._out_of_domain(), [], 0, provider)
+            wrapped["session_id"] = session_id
+            yield {"type": "done", "result": wrapped}
+            return
 
         # retrieve + Self-RAG 重试
-        # mock 模式下向量为字符哈希、无语义，阈值归零以便演示完整检索链路
         is_mock = self.embedder.use_mock
         thr = 0.0 if is_mock else self.s.relevance_threshold
-        # 上下文合并查询：把历史里的话题词并进当前追答一起检索，
-        # 解决碎片化追答（如"好几天了 找过他没用"）丢失主题导致跑题的问题。
         query = self._contextual_query(question, history)
         if query != question:
             log.info("[%s] 上下文合并检索 | %r -> %r", trace_id, question, query)
             steps.append({"stage": "context_merge", "detail": f"{question!r} -> {query!r}", "ms": None})
-        # 复用同一查询向量：知识库检索 + 长期经验检索（避免重复 embedding）
         qvec = self.embedder.embed_query(query)
-        # 长期记忆（P3）：检索其他相似历史案件经验，作为本轮参考
-        experiences = []
-        if session_id:
-            try:
-                experiences = self._exp.search(qvec, top_k=3, exclude_sid=session_id)
-            except Exception as e:  # noqa: BLE001
-                log.warning("[%s] 长期经验检索失败（跳过）：%s", trace_id, e)
         ranked, best = self._retrieve(query, trace_id, steps, query_vec=qvec)
         retries = 0
         while best < thr and retries < self.s.max_retrieve_retries:
             new_query = self._reformulate(query)
-            log.info(
-                "[%s] 低于阈值(%.4f<%.4f) 改写查询 | %r -> %r",
-                trace_id, best, thr, query, new_query,
-            )
-            steps.append({
-                "stage": f"reformulate_r{retries + 1}",
-                "detail": f"{query!r} -> {new_query!r}",
-                "ms": None,
-            })
+            log.info("[%s] 低于阈值(%.4f<%.4f) 改写查询 | %r -> %r", trace_id, best, thr, query, new_query)
+            steps.append({"stage": f"reformulate_r{retries + 1}", "detail": f"{query!r} -> {new_query!r}", "ms": None})
             query = new_query
             ranked, best = self._retrieve(query, trace_id, steps, retry=retries + 1)
             retries += 1
@@ -272,39 +276,47 @@ class RAGPipeline:
                 "建议补充矛盾类型与关键事实，或联系社区调解委员会获取人工协助。"
             )
             log.warning("[%s] 诚实拒答 | 最佳相关度=%.4f < 阈值=%.4f | 重试=%d", trace_id, best, thr, retries)
-            return self._wrap(trace_id, steps, t_total, "retrieve", honest, [], retries, provider)
+            yield {"type": "route", "route": "retrieve", "trace_id": trace_id, "session_id": session_id}
+            wrapped = self._wrap(trace_id, steps, t_total, "retrieve", honest, [], retries, provider)
+            wrapped["session_id"] = session_id
+            yield {"type": "done", "result": wrapped}
+            return
 
-        # 用户角色感知：决定答案视角（居民/调解员/物业）——参考历史，避免追答丢失身份
         role = self._infer_role(question, history)
         mark("infer_role", f"role={role}")
-        # 长期记忆（P1）：载入该会话已沉淀的结构化案件档案，作为本轮事实源注入
         case_profile = self._profiles.get(session_id) if session_id else None
-        answer = self._generate(question, ranked, provider, trace_id, steps, role=role, history=history, profile=case_profile, experiences=experiences)
-        # 长期记忆（P1）：本轮结束后更新并持久化案件档案（合并累积，不丢历史事实）
+
+        # 检索链路已就绪，先把「路由 + 已完成步骤」推给前端（首字前可见骨架）
+        yield {"type": "route", "route": "retrieve", "trace_id": trace_id, "session_id": session_id,
+               "steps": list(steps)}
+
+        # 流式生成答案（首字即可见，体感远快于等整段）
+        answer_parts: list[str] = []
+        t_gen = time.perf_counter()
+        for delta in self._generate_stream(question, ranked, provider, trace_id, role=role, history=history, profile=case_profile):
+            answer_parts.append(delta)
+            yield {"type": "delta", "text": delta}
+        answer = "".join(answer_parts)
+        # 兜底清理：清除模型偶发复述的提示词标记
+        answer = answer.replace("【参考依据】", "")
+        answer = re.sub(r"^\s*参考依据[：:].*$", "", answer, flags=re.M)
+        answer = re.sub(r"\n{3,}", "\n\n", answer).strip()
+        steps.append({"stage": "generate", "detail": f"model={provider} 字数={len(answer)}",
+                      "ms": round((time.perf_counter() - t_gen) * 1000, 1)})
+
+        # 本轮结束后更新并持久化案件档案（合并累积，不丢历史事实）
         if session_id:
             existing = case_profile or {}
             fresh = self._build_case_profile(history, question, role)
             merged = self._merge_profile(existing, fresh)
             self._profiles.save(session_id, merged)
             case_profile = merged
-            # 长期记忆（P3）：把本案画像向量化写入经验库，供未来相似案件检索复用
-            try:
-                exp_text = self._experience_text(merged)
-                exp_vec = self.embedder.embed_query(exp_text)
-                self._exp.upsert(session_id, exp_vec, {
-                    "session_id": session_id,
-                    "case_type": merged.get("case_type", ""),
-                    "opponent": merged.get("opponent", ""),
-                    "identity": merged.get("identity", ""),
-                    "stage": merged.get("stage", ""),
-                    "evidence_status": merged.get("evidence_status", ""),
-                    "key_facts": merged.get("key_facts", {}),
-                    "updated_at": time.time(),
-                })
-            except Exception as e:  # noqa: BLE001
-                log.warning("[%s] 长期经验写入失败（跳过）：%s", trace_id, e)
+
         log.info("[%s] 完成 | 路由=retrieve 来源数=%d 重试=%d 角色=%s", trace_id, len(ranked), retries, role)
-        return self._wrap(trace_id, steps, t_total, "retrieve", answer, ranked, retries, provider, user_role=role, case_profile=case_profile, experiences=experiences)
+        wrapped = self._wrap(trace_id, steps, t_total, "retrieve", answer, ranked, retries, provider,
+                             user_role=role, case_profile=case_profile)
+        wrapped["session_id"] = session_id
+        yield {"type": "done", "result": wrapped}
 
     def _retrieve(self, query: str, trace_id: str, steps: list, retry: int = 0, query_vec: list[float] | None = None) -> tuple[list[dict], float]:
         t = time.perf_counter()
@@ -450,7 +462,7 @@ class RAGPipeline:
         # 特殊处理：起止时间维度需要" richest match"——
         #   "从9点开始搞到凌晨" >> "天天晚上搞"，所以不能首匹配即停。
         _TIME_RICH_KEYWORDS = ("从.*点", "到.*点", "开始.*搞", "搞到", "持续到",
-                               "一直搞到", "\d+点", "\d+:\d+", "整晚", "通宵", "彻夜")
+                               "一直搞到", "\\d+点", "\\d+:\\d+", "整晚", "通宵", "彻夜")
         time_candidates: list[str] = []  # 收集所有起止时间候选，最后选最丰富的
 
         for m in reversed(all_user_msgs):
@@ -670,38 +682,11 @@ class RAGPipeline:
         merged["updated_at"] = time.time()
         return merged
 
-    def _experience_text(self, profile: dict) -> str:
-        """把案件画像拼成可向量化的「经验摘要」文本（供相似案件语义检索）。"""
-        bits = [
-            f"案件类型：{profile.get('case_type') or '未知'}",
-            f"对方当事人：{profile.get('opponent') or '未知'}",
-            f"用户身份：{profile.get('identity') or '未知'}",
-            f"当前阶段：{profile.get('stage') or '未知'}",
-        ]
-        for k, v in (profile.get("key_facts") or {}).items():
-            bits.append(f"{k}：{v}")
-        return "\n".join(bits)
+    def _generate_stream(self, question: str, sources: list[dict], provider: str, trace_id: str, role: str = "resident", history: list[dict] | None = None, profile: dict | None = None):
+        """流式生成：逐块 yield 文本增量（mock 模式下整段一次性 yield）。
 
-    def _generate(self, question: str, sources: list[dict], provider: str, trace_id: str, steps: list, role: str = "resident", history: list[dict] | None = None, profile: dict | None = None, experiences: list | None = None) -> str:
-        # v6：纯感谢/客套消息直接返回自然短回应，不走 LLM（省 token、快、100% 可控）
-        import random
-        _GRATITUDE_KEYWORDS = ["谢谢", "感谢", "真好", "太好了", "有用", "有帮助", "不错",
-                               "厉害", "给力", "棒", "辛苦了"]
-        is_pure_gratitude = (
-            any(kw in question for kw in _GRATITUDE_KEYWORDS)
-            and len(question.strip()) < 30
-            and not any(q in question for q in ["但是", "不过", "可是", "还有个", "另外", "接下来", "然后"])
-        )
-        if is_pure_gratitude:
-            replies = [
-                "不客气，有需要随时问。",
-                "能帮到你就好，有问题再找我。",
-                "不客气，希望对你有帮助！",
-                "应该的，有问题随时说。",
-            ]
-            steps.append({"stage": "generate", "detail": "gratitude-shortcut(跳过LLM)", "ms": 0})
-            return random.choice(replies)
-
+        纯感谢短路已上移到 _run，入口保证不会传入纯客套消息。
+        """
         ctx_blocks = []
         for i, s in enumerate(sources, 1):
             p = s["payload"]
@@ -772,28 +757,6 @@ class RAGPipeline:
                     "若用户本轮给出了与档案冲突的新说法，以用户最新表述为准，"
                     "但不得在回答中声称档案里没有的信息，也不要把用户没说过的内容脑补进去。\n"
                 )
-        # 长期记忆（P3）：相关历史经验（其他相似案件的处置脉络，仅参考不当事实）
-        exp_block = ""
-        if experiences:
-            elines: list[str] = []
-            for e in experiences:
-                bits = []
-                if e.get("case_type"):
-                    bits.append("类型=" + e["case_type"])
-                if e.get("opponent"):
-                    bits.append("对方=" + e["opponent"])
-                if e.get("stage"):
-                    bits.append("阶段=" + e["stage"])
-                if e.get("key_facts"):
-                    bits.append("事实=" + "；".join(f"{k}:{v}" for k, v in e["key_facts"].items()))
-                if bits:
-                    elines.append("  - " + " | ".join(bits))
-            if elines:
-                exp_block = (
-                    "\n【相关历史经验（其他相似案件的处置脉络，仅供借鉴思路，严禁当作本案事实或编造依据）】\n"
-                    + "\n".join(elines) + "\n"
-                    "可参考这些相似案件的处理逻辑来组织建议，但不能把它们的具体情节说成本案已发生的事。\n"
-                )
         # v6：检测用户表达感谢/满意/正面评价 → 强制短回应模式
         _GRATITUDE_PATTERNS = [
             "谢谢", "感谢", "真好", "太好了", "有用", "有帮助", "不错",
@@ -814,7 +777,7 @@ class RAGPipeline:
         prompt = (
             "你是社区矛盾调解助理，必须严格基于下方「相关资料」作答。\n"
             f"本次对话识别到的【用户身份】={role_label}\n{role_g}"
-            f"{fact_block}{asked_block}{profile_block}{exp_block}"
+            f"{fact_block}{asked_block}{profile_block}"
             f"{gratitude_override}"  # v6：感谢时强制覆盖
             "硬性要求：\n"
             "1) 只使用资料中【明确出现】的事实、法条、调解步骤；严禁自行补充资料未提及的法律结论、"
@@ -871,19 +834,11 @@ class RAGPipeline:
             for m in history:
                 msgs.append({"role": "assistant" if m["role"] in ("bot", "assistant") else "user", "content": m["content"]})
         msgs.append({"role": "user", "content": prompt})
-        answer = self.llm.chat(messages=msgs, provider=provider)
-        # 兜底：清除模型偶发复述的提示词标记（根因已在 prompt 中去除）
-        answer = answer.replace("【参考依据】", "")
-        answer = re.sub(r"^\s*参考依据[：:].*$", "", answer, flags=re.M)
-        answer = re.sub(r"\n{3,}", "\n\n", answer).strip()
-        steps.append({
-            "stage": "generate",
-            "detail": f"model={provider} 字数={len(answer)}",
-            "ms": round((time.perf_counter() - t) * 1000, 1),
-        })
-        return answer
+        # 流式输出：逐块 yield 文本增量（清理与耗时统计在 _run 汇总后统一做）
+        for delta in self.llm.stream_chat(messages=msgs, provider=provider):
+            yield delta
 
-    def _wrap(self, trace_id, steps, t_total, route, answer, sources, retries, provider, user_role: str | None = None, case_profile: dict | None = None, experiences: list | None = None) -> dict[str, Any]:
+    def _wrap(self, trace_id, steps, t_total, route, answer, sources, retries, provider, user_role: str | None = None, case_profile: dict | None = None) -> dict[str, Any]:
         # 来源展示门槛：相关度低于阈值的命中视为噪音，不展示给用户
         min_score = self.s.source_display_min_score
         shown = [
@@ -910,7 +865,6 @@ class RAGPipeline:
             "model": provider,
             "latency_ms": round((time.perf_counter() - t_total) * 1000, 1),
             "case_profile": case_profile,
-            "experiences": experiences or [],
             "trace": {
                 "trace_id": trace_id,
                 "route": route,

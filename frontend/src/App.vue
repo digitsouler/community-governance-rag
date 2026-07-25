@@ -58,28 +58,60 @@ async function send(text) {
 
   try {
     // 短期记忆：会话历史由后端按 session_id 拉取，前端不再拼接 history
+    // stream=true 走 SSE：首字即可见，体感远快于等整段
     const sid = await ensureSession()
     const resp = await fetch('/api/chat', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ question, provider: currentModel.value, session_id: sid })
+      body: JSON.stringify({ question, provider: currentModel.value, session_id: sid, stream: true })
     })
-    const data = await resp.json()
     const last = messages[messages.length - 1]
     last.loading = false
-    last.content = data.answer || ''
-    last.route = data.route
-    last.sources = (data.sources || []).filter(s => s.score >= SOURCE_MIN_SCORE)
-    last.retries = data.self_rag_retries
-    last.model = data.model
-    last.latency = data.latency_ms
-    last.traceId = data.trace_id
-    last.trace = data.trace || null
-    last.profile = data.case_profile || null
-    last.experiences = data.experiences || []
-    // 同步 session_id + 刷新侧栏标题 + 案件档案
-    if (data.session_id) sessionId.value = data.session_id
-    updateProfile(data.case_profile)
+    const reader = resp.body.getReader()
+    const decoder = new TextDecoder('utf-8')
+    let buf = ''
+    let acc = ''
+    while (true) {
+      const { done, value } = await reader.read()
+      if (done) break
+      buf += decoder.decode(value, { stream: true })
+      let idx
+      while ((idx = buf.indexOf('\n\n')) >= 0) {
+        const chunk = buf.slice(0, idx)
+        buf = buf.slice(idx + 2)
+        const line = chunk.trim()
+        if (!line.startsWith('data:')) continue
+        const payload = line.slice(5).trim()
+        if (payload === '[DONE]') continue
+        let ev
+        try { ev = JSON.parse(payload) } catch { continue }
+        if (ev.type === 'delta') {
+          acc += ev.text
+          last.content = acc
+        } else if (ev.type === 'route') {
+          last.route = ev.route
+          last.traceId = ev.trace_id
+          if (ev.session_id) sessionId.value = ev.session_id
+        } else if (ev.type === 'done') {
+          last.content = ev.answer
+          last.route = ev.route
+          last.sources = (ev.sources || []).filter(s => s.score >= SOURCE_MIN_SCORE)
+          last.retries = ev.self_rag_retries
+          last.model = ev.model
+          last.latency = ev.latency_ms
+          last.trace = ev.trace
+          last.profile = ev.case_profile || null
+          last.traceId = ev.trace_id
+          if (ev.session_id) sessionId.value = ev.session_id
+          updateProfile(ev.case_profile)
+        } else if (ev.type === 'error') {
+          last.content = '请求失败：' + (ev.error || '')
+        }
+        await nextTick()
+        scrollToBottom()
+      }
+    }
+    last.loading = false
     refreshSessions()
   } catch (e) {
     const last = messages[messages.length - 1]
@@ -461,10 +493,6 @@ function kbGoPage(delta) {
           </div>
           <div v-if="m.loading" class="typing">正在检索知识库并生成…</div>
           <div v-else>{{ m.content }}</div>
-
-          <div v-if="m.experiences && m.experiences.length" class="exp-note">
-            💡 参考了 {{ m.experiences.length }} 个相似历史案件的处理思路
-          </div>
 
           <div v-if="m.sources && m.sources.length" class="sources">
             <div class="source-card" v-for="s in m.sources" :key="s.id">

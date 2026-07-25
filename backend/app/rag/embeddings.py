@@ -66,8 +66,19 @@ class EmbeddingClient:
             log.error("Embedding 调用失败: %s", e)
             raise
 
+    # 进程内查询向量缓存：相同问题不重复打 Embedding API
+    _query_cache: dict[str, list[float]] = {}
+    _CACHE_MAX = 2000
+
     def embed_query(self, text: str) -> list[float]:
-        return self.embed([text])[0]
+        key = text.strip()
+        cached = self._query_cache.get(key)
+        if cached is not None:
+            return cached
+        vec = self.embed([text])[0]
+        if len(self._query_cache) < self._CACHE_MAX:
+            self._query_cache[key] = vec
+        return vec
 
     def _mock_vector(self, text: str) -> list[float]:
         """基于字符哈希的确定性伪向量，仅用于本地冒烟，不可用于真实检索质量评估。"""

@@ -151,6 +151,58 @@ class Handler(BaseHTTPRequestHandler):
         else:
             self._send(404, {"error": "not found"})
 
+    def _stream_chat(self, session_id, question, provider, history, req_id):
+        """SSE 流式问答：逐事件推送 route / delta / done / error，首字即可见。"""
+        self.send_response(200)
+        self.send_header("Content-Type", "text/event-stream; charset=utf-8")
+        self.send_header("Cache-Control", "no-cache")
+        self.send_header("X-Trace-Id", req_id)
+        self.send_header("Access-Control-Allow-Origin", "*")
+        self.end_headers()
+        store = get_session_store()
+
+        def emit(ev: dict):
+            try:
+                self.wfile.write(("data: " + json.dumps(ev, ensure_ascii=False) + "\n\n").encode("utf-8"))
+                self.wfile.flush()
+            except Exception as e:  # noqa: BLE001
+                log.warning("[%s] SSE 写出失败: %s", req_id, e)
+
+        try:
+            for ev in pipeline.query(question, provider, history=history, session_id=session_id, stream=True):
+                if ev.get("type") == "delta":
+                    emit(ev)
+                elif ev.get("type") == "route":
+                    emit(ev)
+                elif ev.get("type") == "done":
+                    res = ev["result"]
+                    res["trace_id"] = res.get("trace_id", req_id)
+                    res["session_id"] = session_id
+                    emit({
+                        "type": "done",
+                        "answer": res["answer"],
+                        "route": res["route"],
+                        "sources": res["sources"],
+                        "self_rag_retries": res["self_rag_retries"],
+                        "model": res["model"],
+                        "latency_ms": res["latency_ms"],
+                        "case_profile": res["case_profile"],
+                        "trace": res["trace"],
+                        "trace_id": res["trace_id"],
+                        "session_id": session_id,
+                    })
+                    store.append_message(session_id, "assistant", res["answer"])
+            emit({"type": "end"})
+        except Exception as e:  # noqa: BLE001
+            log.error("[%s] SSE 处理异常 | %s", req_id, e)
+            emit({"type": "error", "error": str(e), "trace_id": req_id})
+        finally:
+            try:
+                self.wfile.write(b"data: [DONE]\n\n")
+                self.wfile.flush()
+            except Exception:
+                pass
+
     def do_POST(self):
         path = urlparse(self.path).path
         length = int(self.headers.get("Content-Length", 0))
@@ -196,9 +248,13 @@ class Handler(BaseHTTPRequestHandler):
             t0 = time.perf_counter()
             log.info("[%s] POST /api/chat | sid=%s | provider=%s | 历史=%d | q=%r",
                      req_id, session_id, provider or settings.default_llm, len(history), question[:60])
+            use_stream = bool(data.get("stream"))
             try:
                 # 先落「用户问题」到会话存储，再生成答案
                 store.append_message(session_id, "user", question)
+                if use_stream:
+                    self._stream_chat(session_id, question, provider, history, req_id)
+                    return
                 result = pipeline.query(question, provider, history=history, session_id=session_id)
                 result["trace_id"] = result.get("trace_id", req_id)
                 store.append_message(session_id, "assistant", result["answer"])

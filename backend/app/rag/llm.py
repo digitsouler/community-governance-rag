@@ -9,6 +9,7 @@
 """
 from __future__ import annotations
 
+import json
 import time
 
 import httpx
@@ -73,6 +74,42 @@ class LLMClient:
             return content
         except Exception as e:
             log.error("LLM 调用失败 | provider=%s: %s", cfg["provider"], e)
+            raise
+
+    def stream_chat(self, messages: list[dict], provider: ProviderName | None = None, temperature: float = 0.3):
+        """流式生成：逐块 yield 文本增量（mock 模式下整段一次性 yield）。"""
+        provider = provider or self.s.default_llm
+        cfg = resolve_model(provider, self.s)
+        if self.s.mock or not cfg["api_key"]:
+            yield self._mock_reply(messages, cfg)
+            return
+        url = f"{cfg['base_url']}/chat/completions"
+        log.info("LLM 流式请求 | provider=%s model=%s | 消息数=%d", cfg["provider"], cfg["model"], len(messages))
+        try:
+            with self.http.stream(
+                "POST", url,
+                headers={"Authorization": f"Bearer {cfg['api_key']}"},
+                json={"model": cfg["model"], "messages": messages, "temperature": temperature, "stream": True},
+            ) as resp:
+                resp.raise_for_status()
+                for line in resp.iter_lines():
+                    if not line:
+                        continue
+                    if isinstance(line, bytes):
+                        line = line.decode("utf-8")
+                    if line.startswith("data:"):
+                        payload = line[5:].strip()
+                        if payload == "[DONE]":
+                            break
+                        try:
+                            chunk = json.loads(payload)
+                            delta = chunk["choices"][0]["delta"].get("content", "")
+                            if delta:
+                                yield delta
+                        except Exception:
+                            continue
+        except Exception as e:
+            log.error("LLM 流式调用失败 | provider=%s: %s", cfg["provider"], e)
             raise
 
     def _mock_reply(self, messages: list[dict], cfg: dict) -> str:
