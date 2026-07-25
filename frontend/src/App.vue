@@ -171,6 +171,7 @@ async function send(text) {
           last.latency = ev.latency_ms
           last.trace = ev.trace
           last.profile = ev.case_profile || null
+          last.decomposition = ev.decomposition || null
           last.traceId = ev.trace_id
           if (ev.session_id) sessionId.value = ev.session_id
           updateProfile(ev.case_profile)
@@ -618,6 +619,12 @@ function kbGoPage(delta) {
             {{ routeLabel[m.route] || m.route }} · 模型 {{ m.model }}
             <span v-if="m.retries"> · 自纠错重试 {{ m.retries }} 次</span>
           </div>
+          <div v-if="m.decomposition && m.decomposition.enabled" class="decomp-box">
+            <span class="decomp-title">🧩 查询已自动拆分（{{ m.decomposition.sub_queries.length }} 个子问题分别检索后合并）</span>
+            <ol class="decomp-list">
+              <li v-for="(sq, di) in m.decomposition.sub_queries" :key="di">{{ sq }}</li>
+            </ol>
+          </div>
           <div v-if="m.loading" class="typing">正在检索知识库并生成…</div>
           <div v-else class="answer-body" v-html="renderAnswer(m.content, m.sources)"></div>
 
@@ -795,6 +802,29 @@ function kbGoPage(delta) {
   border-bottom: 1px dashed #eef2f7;
 }
 .trace-step:last-child { border-bottom: none; }
+.decomp-box {
+  margin: 8px 0 4px;
+  padding: 8px 10px;
+  background: #eef5ff;
+  border: 1px solid #cfe0ff;
+  border-radius: 8px;
+}
+.decomp-title {
+  display: block;
+  color: #1d4ed8;
+  font-size: 12px;
+  font-weight: 600;
+  margin-bottom: 4px;
+}
+.decomp-list {
+  margin: 0;
+  padding-left: 18px;
+}
+.decomp-list li {
+  color: #334155;
+  font-size: 12.5px;
+  line-height: 1.6;
+}
 .ts-stage {
   flex: 0 0 96px;
   color: #0f172a;

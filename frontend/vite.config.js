@@ -5,6 +5,7 @@ import vue from '@vitejs/plugin-vue'
 export default defineConfig({
   plugins: [vue()],
   server: {
+    host: true, // 监听 0.0.0.0 + ::，使 127.0.0.1 与局域网/手机也能访问
     port: 5173,
     proxy: {
       '/api': 'http://localhost:8000'

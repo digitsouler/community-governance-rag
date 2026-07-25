@@ -10,13 +10,13 @@
 """
 from __future__ import annotations
 
+import json
 import re
 import time
 import uuid
 from typing import Any
 
 from app.config import ProviderName, Settings, get_settings
-from app.gateway import get_guardrails
 from app.log import get_logger
 from app.profile_store import get_profile_store
 from app.rag.embeddings import EmbeddingClient
@@ -172,6 +172,88 @@ class RAGPipeline:
             q = q.replace(w, "")
         return q.strip() or query
 
+    # ---------- Query Decomposition（复杂纠纷分步检索合并） ----------
+    def _should_decompose(self, question: str) -> bool:
+        """启发式判断是否需查询分解：仅对「复杂、多子问题」的检索类问题开启。
+
+        避免简单问题被无谓拆分（多一次 LLM 调用 + 多次检索，反而变慢变贵）。
+        """
+        q = question.strip()
+        # 调试用：触发条件详情（重启后看 logs/app.log 即可判断为什么没拆）
+        log.info("[decompose-debug] q_len=%d qmark=%d qwords=%d | q=%r",
+                 len(q), q.count("?") + q.count("？"),
+                 q.count("怎么办") + q.count("怎么") + q.count("如何") + q.count("怎样") + q.count("咋"),
+                 q[:50])
+        if len(q) < 36:
+            return False
+        # 多个问号
+        if q.count("?") + q.count("？") >= 2:
+            return True
+        # 多个疑问词（怎么/如何/怎么办/怎样/咋）
+        qwords = q.count("怎么办") + q.count("怎么") + q.count("如何") + q.count("怎样") + q.count("咋")
+        if qwords >= 2:
+            return True
+        # 并列诉求（连词 + 赔偿/程序/处理等）
+        conj = ["还有", "另外", "以及", "同时", "除此之外", "此外", "并且", "加", "和"]
+        if any(c in q for c in conj) and any(
+            k in q for k in ("赔偿", "怎么办", "怎么", "程序", "处理", "主张", "如何")
+        ):
+            return True
+        return False
+
+    @staticmethod
+    def _parse_json_list(raw: str) -> list:
+        """从 LLM 输出里稳健地抠出 JSON 数组（兼容代码块 / 多余前后文本）。"""
+        if not raw:
+            return []
+        raw = raw.strip()
+        raw = re.sub(r"^```(?:json)?\s*", "", raw)
+        raw = re.sub(r"\s*```$", "", raw).strip()
+        try:
+            data = json.loads(raw)
+        except Exception:
+            m = re.search(r"\[.*\]", raw, re.S)
+            if not m:
+                return []
+            try:
+                data = json.loads(m.group(0))
+            except Exception:
+                return []
+        if isinstance(data, list):
+            return [x for x in data if isinstance(x, (str, int, float))]
+        return []
+
+    def _decompose(self, question: str, provider: str, trace_id: str, steps: list) -> list[str]:
+        """用 LLM 把复杂问题拆成 2-4 个独立子问题，分别检索后合并。"""
+        t = time.perf_counter()
+        sys_p = (
+            "你是一个社区矛盾调解问题的【查询拆解器】。居民的一段咨询往往混杂多个子问题"
+            "（责任认定、举证责任、赔偿范围、解决程序等）。请把用户的问题拆成 2-4 个相互独立、"
+            "可分别检索知识库的子问题，每个子问题聚焦于单一维度。\n"
+            "只输出一个 JSON 数组，元素为字符串子问题，不要任何解释或 markdown 代码块标记。\n"
+            "示例输入：楼上漏水泡坏我天花板装修，邻居不认，物业说过了保修期，我该怎么办、能要多少赔偿、走什么程序？\n"
+            "示例输出：[\"楼上漏水导致自家财产受损，法律责任如何认定\"，"
+            "\"邻居不承认漏水，举证责任由谁承担、如何取证\"，"
+            "\"物业以过保修期为由拒管，其在此事中的责任边界\"，"
+            "\"漏水致天花板与装修损坏，可主张哪些赔偿项目及标准\"，"
+            "\"邻里漏水纠纷的解决程序：协商、调解、12345、诉讼的先后顺序\"]"
+        )
+        try:
+            raw = self.llm.chat(
+                [{"role": "system", "content": sys_p}, {"role": "user", "content": question}],
+                provider=provider, temperature=0.0,
+            )
+            subs = self._parse_json_list(raw)
+            subs = [str(s).strip() for s in subs if str(s).strip()][: self.s.max_sub_queries]
+            if len(subs) < 2:
+                return []
+            steps.append({"stage": "decompose", "detail": f"子问题={len(subs)}",
+                          "ms": round((time.perf_counter() - t) * 1000, 1)})
+            return subs
+        except Exception as e:  # noqa: BLE001
+            log.warning("[%s] 查询分解失败，退回单查询 | %s", trace_id, e)
+            return []
+
     # ---------- 对外接口 ----------
     def query(self, question, provider=None, history=None, session_id=None, stream=False, user_role=None):
         """统一入口。
@@ -202,7 +284,7 @@ class RAGPipeline:
             ms = (time.perf_counter() - start) * 1000 if start else None
             steps.append({"stage": stage, "detail": detail, "ms": round(ms, 1) if ms is not None else None})
 
-        log.info("[%s] 新请求 | provider=%s | q=%r", trace_id, provider, get_guardrails().redact(question)[:60])
+        log.info("[%s] 新请求 | provider=%s | q=%r", trace_id, provider, question[:60])
 
         # 纯感谢/客套消息短路——在路由之前拦截，不走 LLM（省 token、快、100% 可控）
         _GRATITUDE_KW = ["谢谢", "感谢", "真好", "太好了", "有用", "有帮助",
@@ -253,28 +335,66 @@ class RAGPipeline:
             yield {"type": "done", "result": wrapped}
             return
 
-        # retrieve + Self-RAG 重试
+        # ---------- Query Decomposition（复杂纠纷分步检索合并）----------
+        decomposition: dict[str, Any] = {"enabled": False, "sub_queries": []}
+        retries = 0
         is_mock = self.embedder.use_mock
         thr = 0.0 if is_mock else self.s.relevance_threshold
-        query = self._contextual_query(question, history)
-        if query != question:
-            log.info("[%s] 上下文合并检索 | %r -> %r", trace_id,
-                     get_guardrails().redact(question), get_guardrails().redact(query))
-            steps.append({"stage": "context_merge",
-                          "detail": f"{get_guardrails().redact(question)!r} -> {get_guardrails().redact(query)!r}",
-                          "ms": None})
-        qvec = self.embedder.embed_query(query)
-        ranked, best = self._retrieve(query, trace_id, steps, query_vec=qvec)
-        retries = 0
-        while best < thr and retries < self.s.max_retrieve_retries:
-            new_query = self._reformulate(query)
-            gr = get_guardrails()
-            log.info("[%s] 低于阈值(%.4f<%.4f) 改写查询 | %r -> %r", trace_id, best, thr,
-                     gr.redact(query)[:60], gr.redact(new_query)[:60])
-            steps.append({"stage": f"reformulate_r{retries + 1}", "detail": f"{gr.redact(query)!r} -> {gr.redact(new_query)!r}", "ms": None})
-            query = new_query
-            ranked, best = self._retrieve(query, trace_id, steps, retry=retries + 1)
-            retries += 1
+
+        if (not is_mock) and self.s.enable_decomposition and self._should_decompose(question):
+            sub_queries = self._decompose(question, provider, trace_id, steps)
+            if sub_queries:
+                all_hits: list[dict] = []
+                seen_ids: set = set()
+                for sq in sub_queries:
+                    sq_vec = self.embedder.embed_query(sq)
+                    hits, _ = self._retrieve(sq, trace_id, steps, query_vec=sq_vec)
+                    for h in hits:
+                        hid = h.get("id")
+                        if hid and hid not in seen_ids:
+                            seen_ids.add(hid)
+                            all_hits.append(h)
+                if all_hits:
+                    all_hits.sort(
+                        key=lambda x: x.get("rerank_score", x.get("score", 0.0)),
+                        reverse=True,
+                    )
+                    ranked = all_hits[: self.s.top_k * 2]
+                    best = ranked[0].get("rerank_score", ranked[0].get("score", 0.0))
+                    decomposition = {"enabled": True, "sub_queries": sub_queries}
+                    log.info("[%s] 查询分解完成 | 子问题=%d 合并去重后命中=%d", trace_id, len(sub_queries), len(all_hits))
+                else:
+                    sub_queries = []  # 子检索无果，退回单查询路径
+            if not decomposition["enabled"]:
+                # 退回普通单查询 + Self-RAG 改写重试
+                query = self._contextual_query(question, history)
+                if query != question:
+                    log.info("[%s] 上下文合并检索 | %r -> %r", trace_id, question, query)
+                    steps.append({"stage": "context_merge", "detail": f"{question!r} -> {query!r}", "ms": None})
+                qvec = self.embedder.embed_query(query)
+                ranked, best = self._retrieve(query, trace_id, steps, query_vec=qvec)
+                while best < thr and retries < self.s.max_retrieve_retries:
+                    new_query = self._reformulate(query)
+                    log.info("[%s] 低于阈值(%.4f<%.4f) 改写查询 | %r -> %r", trace_id, best, thr, query, new_query)
+                    steps.append({"stage": f"reformulate_r{retries + 1}", "detail": f"{query!r} -> {new_query!r}", "ms": None})
+                    query = new_query
+                    ranked, best = self._retrieve(query, trace_id, steps, retry=retries + 1)
+                    retries += 1
+        else:
+            # 简单问题 / mock 模式：普通单查询 + Self-RAG 改写重试
+            query = self._contextual_query(question, history)
+            if query != question:
+                log.info("[%s] 上下文合并检索 | %r -> %r", trace_id, question, query)
+                steps.append({"stage": "context_merge", "detail": f"{question!r} -> {query!r}", "ms": None})
+            qvec = self.embedder.embed_query(query)
+            ranked, best = self._retrieve(query, trace_id, steps, query_vec=qvec)
+            while best < thr and retries < self.s.max_retrieve_retries:
+                new_query = self._reformulate(query)
+                log.info("[%s] 低于阈值(%.4f<%.4f) 改写查询 | %r -> %r", trace_id, best, thr, query, new_query)
+                steps.append({"stage": f"reformulate_r{retries + 1}", "detail": f"{query!r} -> {new_query!r}", "ms": None})
+                query = new_query
+                ranked, best = self._retrieve(query, trace_id, steps, retry=retries + 1)
+                retries += 1
 
         if not ranked or best < thr:
             honest = (
@@ -299,7 +419,7 @@ class RAGPipeline:
         # 流式生成答案（首字即可见，体感远快于等整段）
         answer_parts: list[str] = []
         t_gen = time.perf_counter()
-        for delta in self._generate_stream(question, ranked, provider, trace_id, role=role, history=history, profile=case_profile):
+        for delta in self._generate_stream(question, ranked, provider, trace_id, role=role, history=history, profile=case_profile, decomposed=decomposition["enabled"]):
             answer_parts.append(delta)
             yield {"type": "delta", "text": delta}
         answer = "".join(answer_parts)
@@ -320,7 +440,7 @@ class RAGPipeline:
 
         log.info("[%s] 完成 | 路由=retrieve 来源数=%d 重试=%d 角色=%s", trace_id, len(ranked), retries, role)
         wrapped = self._wrap(trace_id, steps, t_total, "retrieve", answer, ranked, retries, provider,
-                             user_role=role, case_profile=case_profile)
+                             user_role=role, case_profile=case_profile, decomposition=decomposition)
         wrapped["session_id"] = session_id
         yield {"type": "done", "result": wrapped}
 
@@ -374,13 +494,13 @@ class RAGPipeline:
         """
         if explicit_role and explicit_role in self.VALID_ROLES:
             return explicit_role
-        # 降级推断（兼容旧调用 / 未选身份的情况）
+        # 降级推断
         return self._infer_role(question, history)
 
     def _infer_role(self, question: str, history: list[dict] | None = None) -> str:
         """从用户措辞推断其身份，用于决定答案视角。
 
-        默认 'resident'（居民/当事人/投诉人）——因为我们面对的主要是来维权的居民；
+        默认 'resident'
         命中调解/社区工作口吻则判定为 'mediator'；命中物业职责口吻为 'property'。
         多轮场景下把历史用户话合并判断，避免碎片化追答丢失身份。
         """
@@ -399,68 +519,27 @@ class RAGPipeline:
         # 居民 / 当事人 / 投诉人（含显式自述或默认）
         return "resident"
 
-    # 强制补全前缀：以角色专属开口句式收尾 prompt，利用续写机制锁定正确人称（兜底指令跟随失效）。
-    ROLE_OPEN = {
-        "resident": "请直接以「你可以」开头作答（不要写「你（调解员）」等他人称谓）：",
-        "mediator": "请直接以「你（调解员）应」开头作答（不要写「你可以用手机录」这种给居民的建议）：",
-        "property": "请直接以「你（物业）应」开头作答（不要写「你可以用手机录」这种给居民的建议）：",
-        "grid_worker": "请直接以「你（网格员）应」开头作答（不要写「你可以用手机录」这种给居民的建议）：",
-    }
-
-    # 角色专属 system 人设：把"视角/称谓"写进 system（基础人设权重高于长 user prompt），
-    # 保证居民/调解员/物业/网格员看到的回答从开口称谓就明显不同。
-    ROLE_SYSTEM = {
-        "resident": (
-            "你正在协助一位遇到邻里/物业/家庭矛盾的【居民（当事人/投诉人）】。"
-            "请用『你可以…』的口吻，直接给这位居民本人能执行的维权动作建议；"
-            "若资料以调解员视角写（如『引导受害方留存证据』），必须转换为居民本人动作（『你可以用手机录下证据』）。"
-        ),
-        "mediator": (
-            "你正在协助一位【社区调解员/居委会工作人员】处理矛盾。"
-            "请用『你（调解员）应…』的口吻，给出调解员本人要执行的处置动作"
-            "（受理登记、核实走访、约谈双方、组织调解、签订约定、回访）；"
-            "绝对不要把动作推给居民（禁止出现『居民应…』『受害方应…』）。"
-        ),
-        "property": (
-            "你正在协助一位【物业服务人员（管家/工程/安保）】处理矛盾。"
-            "请用『你（物业）应…』的口吻，给出物业方要执行的动作"
-            "（现场查勘、台账/工单记录、协调工程或安保、向业主反馈、上报社区）；"
-            "禁止出现『居民应…』『受害方应…』。"
-        ),
-        "grid_worker": (
-            "你正在协助一位【网格员/社工】一线走访处置。"
-            "请用『你（网格员）应…』的口吻，给出一线走访动作"
-            "（上门安全注意、证据固定、联动社区/派出所/民政、文书记录）；"
-            "禁止出现『居民应…』『受害方应…』。"
-        ),
-    }
-
     def _role_guidance(self, role: str, known_facts: dict[str, str] | None = None) -> str:
+        """按角色返回生成约束，嵌进 _generate 的提示词。"""
         known = known_facts or {}
         known_dims = "、".join(known.keys()) if known else ""
         if role == "mediator":
             return (
-                "【对话对象】社区调解员 / 社工 / 居委会工作人员（你就是一线调解人）。\n"
-                "【格式铁律】每条建议必须以『你（调解员）应/可…』开头，绝对不能写成给居民的第三人称。\n"
-                "示例：用户问噪音怎么办 →『你（调解员）应上门核实噪音源与时段，分别约谈双方做好笔录，"
-                "并依据管理规约要求装修方在22:00-7:00禁止高噪音施工[1]。』\n"
-                "按专业流程推进：受理登记→核实走访→组织调解→签订约定→回访。\n"
+                "【对话对象】社区调解员 / 社工 / 居委会工作人员。\n"
+                "【回答要求】按专业流程组织：受理登记→核实走访→组织调解→签订约定→回访。"
+                "直接引用知识库步骤原文，专业口吻，不废话不客套。\n"
             )
         if role == "property":
             return (
-                "【对话对象】物业服务人员（管家/工程/安保等，你就是物业方）。\n"
-                "【格式铁律】每条建议必须以『你（物业）应/可…』开头，绝对不能写成给居民的第三人称。\n"
-                "示例：用户问漏水怎么办 →『你（物业）应现场查勘渗漏点，登记台账并协调工程维修，"
-                "同时向双方反馈责任认定进度[1]。』\n"
-                "从物业职责给动作：现场核实、台账/工单、协调工程或安保、向业主反馈、上报社区。\n"
+                "【对话对象】物业服务人员（管家/工程/安保等）。\n"
+                "【回答要求】从物业职责角度给可执行动作：现场核实、台账记录、协调工程/安保、"
+                "向业主反馈、上报社区。物业工作口吻，简洁直接。\n"
             )
         if role == "grid_worker":
             return (
-                "【对话对象】网格员 / 社工（一线走访人员，你就是上门的人）。\n"
-                "【格式铁律】每条建议必须以『你（网格员）应/可…』开头，绝对不能写成给居民的第三人称。\n"
-                "示例：用户反映独居老人异常 →『你（网格员）应敲门确认老人安全，联动社区与家属，"
-                "必要时报民政纳入关爱台账[1]。』\n"
-                "从一线走访给行动指引：上门安全、证据固定、联动资源（社区/派出所/民政）、文书记录。\n"
+                "【对话对象】网格员 / 社工（一线走访人员）。\n"
+                "【回答要求】从一线走访视角给行动指引：上门安全注意、证据固定、联动资源（"
+                "社区/派出所/民政）、文书模板。务实口吻，关注执行细节。\n"
             )
         # resident（默认）
         ask_rule = (
@@ -474,11 +553,12 @@ class RAGPipeline:
             "只在信息确实严重不足时，才可在建议末尾简短提一句还需要什么信息。"
         )
         return (
-            "【对话对象】居民 / 业主 / 当事人（遇到矛盾的一方，你就是受害者/投诉人）。\n"
-            "【格式铁律】每条建议必须以『你可以/应该…』开头，站在『你能做什么』的角度。\n"
-            "【视角转换】知识库大多是从调解员视角写的（如『引导受害方留存证据』），必须转换为居民本人动作："
-            "→『你可以用手机录下噪音、保留视频证据，并请物业或社区上门核实』；"
-            "绝不能把『调解员/物业要做的动作』直接当成『你要做的动作』。\n"
+            "【对话对象】居民 / 业主 / 当事人（遇到矛盾的一方）。\n"
+            "【回答要求】\n"
+            "1) 不要任何客套话（禁止「别急」「理解你的困扰」「抱歉听到这些」），直接给建议。\n"
+            "2) 站在『你能做什么』的角度。知识库很多是从调解员视角写的，必须转换为对居民的行动建议"
+            "（例：『调解员应上门走访』→『你可以请物业或社区上门核实，自己同时留存录音/视频』）；"
+            "绝不能把『调解员要做的事』当成『你要做的事』。\n"
             f"{ask_rule}\n"
             "4) 一次只给最紧急、最可执行的 2-4 条，每条一句话带过，不要展开解释『为什么这么做』。\n"
             "5) 法条用大白话解释，不要念原文。\n"
@@ -743,7 +823,7 @@ class RAGPipeline:
         merged["updated_at"] = time.time()
         return merged
 
-    def _generate_stream(self, question: str, sources: list[dict], provider: str, trace_id: str, role: str = "resident", history: list[dict] | None = None, profile: dict | None = None):
+    def _generate_stream(self, question: str, sources: list[dict], provider: str, trace_id: str, role: str = "resident", history: list[dict] | None = None, profile: dict | None = None, decomposed: bool = False):
         """流式生成：逐块 yield 文本增量（mock 模式下整段一次性 yield）。
 
         纯感谢短路已上移到 _run，入口保证不会传入纯客套消息。
@@ -835,10 +915,20 @@ class RAGPipeline:
                 "4) 不要提资料、法条、检索结果。\n\n"
             )
 
+        # Query Decomposition 命中：引导按子问题维度分点覆盖
+        decomp_guidance = ""
+        if decomposed:
+            decomp_guidance = (
+                "6) 用户问题已被拆分为多个子问题并分别检索合并了资料；"
+                "请按子问题维度（如：责任认定 → 举证责任 → 赔偿范围 → 解决程序）"
+                "分点组织回答，确保每个维度都有对应资料支撑、覆盖完整。\n"
+            )
+
         prompt = (
             "你是社区矛盾调解助理，必须严格基于下方「相关资料」作答。\n"
+            f"本次对话识别到的【用户身份】={role_label}\n{role_g}"
             f"{fact_block}{asked_block}{profile_block}"
-            f"{gratitude_override}"
+            f"{gratitude_override}{decomp_guidance}"
             "硬性要求：\n"
             "1) 只使用资料中【明确出现】的事实、法条、调解步骤；严禁自行补充资料未提及的法律结论、"
             "法条名称、处罚措施、时限或任何外部知识。\n"
@@ -857,18 +947,7 @@ class RAGPipeline:
             "   d) 用户感谢/夸奖时自然简短回应（如『不客气，有需要随时问』），绝不自我介绍或背定位话术。\n"
             "   e) 【严禁编造用户细节】引用用户描述时严格用原话原意，不得添油加醋。\n"
             "   f) 每条建议一句话带过，小建议不要展开长篇解释，不要每条都配『为什么这么做』。\n\n"
-            f"相关资料：\n{context}\n\n"
-            f"【最后强调·视角转换】本次对话对象身份 = {role_label}。{role_g}"
-            "资料中的建议若以第三方/调解员视角撰写（如『引导受害方留存证据』『要求装修方停止』），"
-            "必须按上方身份改写为该身份本人要执行的动作，绝不能直接套用原文人称。\n"
-            "【示范】同样面对『楼上装修噪音』，四种身份的开头必须不同：\n"
-            "· 居民：『你可以用手机录下噪音视频，并请物业上门核实…』\n"
-            "· 调解员：『你（调解员）应上门核实噪音源，分别约谈双方并做好笔录…』\n"
-            "· 物业：『你（物业）应现场查勘渗漏/噪音点，登记台账并协调工程整改…』\n"
-            "· 网格员：『你（网格员）应上门了解实情，联动社区与民警固定证据…』\n"
-            "若你的回答开头是『你可以用手机录』却不是居民身份，说明你忽略了身份，必须重答。\n\n"
-            f"用户的问题是：{question}\n"
-            + self.ROLE_OPEN[role]
+            f"相关资料：\n{context}\n\n用户的问题是：{question}"
         )
         t = time.perf_counter()
         # 多轮对话：system + 历史对话 + 当前（带检索资料的）问题
@@ -878,8 +957,8 @@ class RAGPipeline:
                 "content": (
                     "社区矛盾调解助理。你的全部回答必须严格依据用户提供的检索资料，"
                     "绝不外推或编造资料中不存在的法条与事实；资料不足时基于已有内容给建议，不要强调自己没有。"
-                    + self.ROLE_SYSTEM[role]
-                    + "这是一段【连续对话】，核心纪律："
+                    f"本次对话对象身份为：{role_label}，请从该角色视角组织回答。"
+                    "这是一段【连续对话】，核心纪律："
                     "1) 用户的当前发言可能是在回答你上一轮的追问，务必结合上文语境理解；"
                     "2) 【绝对禁止重复追问】——若用户已在历史对话中透露过某项信息（如持续时长、"
                     "是否沟通过、对方态度、是否找过物业等），你绝不能再问同一维度的问题；"
@@ -904,7 +983,7 @@ class RAGPipeline:
         for delta in self.llm.stream_chat(messages=msgs, provider=provider):
             yield delta
 
-    def _wrap(self, trace_id, steps, t_total, route, answer, sources, retries, provider, user_role: str | None = None, case_profile: dict | None = None) -> dict[str, Any]:
+    def _wrap(self, trace_id, steps, t_total, route, answer, sources, retries, provider, user_role: str | None = None, case_profile: dict | None = None, decomposition: dict | None = None) -> dict[str, Any]:
         # 来源展示门槛：相关度低于阈值的命中视为噪音，不展示给用户
         min_score = self.s.source_display_min_score
         shown = [
@@ -931,6 +1010,7 @@ class RAGPipeline:
             "model": provider,
             "latency_ms": round((time.perf_counter() - t_total) * 1000, 1),
             "case_profile": case_profile,
+            "decomposition": decomposition or {"enabled": False, "sub_queries": []},
             "trace": {
                 "trace_id": trace_id,
                 "route": route,

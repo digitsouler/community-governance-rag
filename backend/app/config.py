@@ -99,6 +99,12 @@ class Settings(BaseSettings):
     # ---- Mock 模式（无密钥也能跑通管道，仅用于本地冒烟）----
     mock: bool = False
 
+    # ---- 查询分解（复杂纠纷分步检索合并）----
+    # 开启后，对复杂多子问题（长句 / 多问号 / 并列诉求）自动拆成多个子问题，
+    # 分别检索再合并重排；简单问题不受影响（走原有单查询路径）。
+    enable_decomposition: bool = True
+    max_sub_queries: int = 4
+
 
 @lru_cache
 def get_settings() -> Settings:

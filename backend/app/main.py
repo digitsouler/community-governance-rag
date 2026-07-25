@@ -220,6 +220,7 @@ class Handler(BaseHTTPRequestHandler):
                         "trace": res["trace"],
                         "trace_id": res["trace_id"],
                         "session_id": session_id,
+                        "decomposition": res.get("decomposition", {"enabled": False, "sub_queries": []}),
                     })
                     store.append_message(session_id, "assistant", answer)
                     audit("chat", trace_id=req_id, user_id=user_id, ip=ip, session_id=session_id,
