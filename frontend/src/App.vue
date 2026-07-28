@@ -122,7 +122,7 @@ document.addEventListener('click', closeHistoryMenu)
 document.addEventListener('keydown', e => { if (e.key === 'Escape') closeHistoryMenu() })
 
 const userQuestions = computed(() => {
-  return messages.value
+  return messages
     .map((m, i) => ({ m, i }))
     .filter(x => x.m.role === 'user' && x.m.content)
     .map(x => {
