@@ -86,6 +86,9 @@ const welcomeText = computed(() => {
 })
 
 onMounted(async () => {
+  // 注册本会话提问下拉的全局监听（在 onMounted 里注册，避免 HMR / SSR 反复创建）
+  document.addEventListener('click', onDocClickForHistory)
+  document.addEventListener('keydown', onDocKeyForHistory)
   try {
     const r = await fetch('/api/models')
     const data = await r.json()
@@ -117,9 +120,14 @@ function toggleHistoryMenu() {
   showHistoryMenu.value = !showHistoryMenu.value
 }
 function closeHistoryMenu() { showHistoryMenu.value = false }
-// 点击外部/按 Esc 关闭
-document.addEventListener('click', closeHistoryMenu)
-document.addEventListener('keydown', e => { if (e.key === 'Escape') closeHistoryMenu() })
+// 点击外部关闭：用 closest 判断是否点在 .history-menu 内（关键——之前 document 全局监听抢跑 toggle，导致点不开）
+function onDocClickForHistory(e) {
+  if (!showHistoryMenu.value) return
+  const t = e && e.target
+  if (t && t.closest && t.closest('.history-menu')) return
+  showHistoryMenu.value = false
+}
+function onDocKeyForHistory(e) { if (e.key === 'Escape') closeHistoryMenu() }
 
 const userQuestions = computed(() => {
   return messages
@@ -583,37 +591,39 @@ function kbGoPage(delta) {
     <div class="main">
       <header class="app-header">
         <h1>🤝 社区矛盾调解 RAG 助手 <span class="badge">Agentic RAG</span></h1>
-        <div class="header-right">
+        <div class="header-bar">
           <nav class="tabs">
             <button :class="['tab', { active: tab === 'chat' }]" @click="switchTab('chat')">对话</button>
             <button :class="['tab', { active: tab === 'kb' }]" @click="switchTab('kb')">知识库</button>
           </nav>
-          <div class="history-menu" v-if="tab === 'chat'">
-            <button class="history-btn" :class="{ active: showHistoryMenu }"
-                    @click="toggleHistoryMenu" :title="`本会话提问（${userQuestions.length}）`">
-              📋 本会话提问 <span class="badge-count" v-if="userQuestions.length">{{ userQuestions.length }}</span>
-              <span class="caret" :class="{ open: showHistoryMenu }">▾</span>
-            </button>
-            <div class="history-dropdown" v-if="showHistoryMenu" @click.stop>
-              <div class="history-dropdown-head">
-                <span>本会话用户提问（{{ userQuestions.length }}）</span>
-                <button class="history-close" @click="showHistoryMenu = false" title="关闭">×</button>
+          <div class="header-controls" v-if="tab === 'chat'">
+            <div class="history-menu">
+              <button class="history-btn" :class="{ active: showHistoryMenu }"
+                      @click="toggleHistoryMenu" :title="`本会话提问（${userQuestions.length}）`">
+                📋 本会话提问 <span class="badge-count" v-if="userQuestions.length">{{ userQuestions.length }}</span>
+                <span class="caret" :class="{ open: showHistoryMenu }">▾</span>
+              </button>
+              <div class="history-dropdown" v-if="showHistoryMenu" @click.stop>
+                <div class="history-dropdown-head">
+                  <span>本会话用户提问（{{ userQuestions.length }}）</span>
+                  <button class="history-close" @click="showHistoryMenu = false" title="关闭">×</button>
+                </div>
+                <div class="history-list" v-if="userQuestions.length">
+                  <button v-for="q in userQuestions" :key="q.i"
+                          class="history-item" @click="jumpToUserQuestion(q.i)">
+                    <span class="history-idx">#{{ q.i + 1 }}</span>
+                    <span class="history-text" :title="q.text">{{ q.preview }}</span>
+                  </button>
+                </div>
+                <div class="history-empty" v-else>本会话还没有提问</div>
               </div>
-              <div class="history-list" v-if="userQuestions.length">
-                <button v-for="q in userQuestions" :key="q.i"
-                        class="history-item" @click="jumpToUserQuestion(q.i)">
-                  <span class="history-idx">#{{ q.i + 1 }}</span>
-                  <span class="history-text" :title="q.text">{{ q.preview }}</span>
-                </button>
-              </div>
-              <div class="history-empty" v-else>本会话还没有提问</div>
             </div>
+            <select class="model-select" v-model="currentModel">
+              <option v-for="m in models" :key="m.provider" :value="m.provider">
+                {{ m.label }}（{{ m.model }}）{{ m.available ? '' : '· 未配置key' }}
+              </option>
+            </select>
           </div>
-          <select class="model-select" v-model="currentModel" v-if="tab === 'chat'">
-            <option v-for="m in models" :key="m.provider" :value="m.provider">
-              {{ m.label }}（{{ m.model }}）{{ m.available ? '' : '· 未配置key' }}
-            </option>
-          </select>
         </div>
       </header>
 
