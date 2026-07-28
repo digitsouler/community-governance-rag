@@ -20,6 +20,7 @@ from app.config import ProviderName, Settings, get_settings
 from app.log import get_logger
 from app.profile_store import get_profile_store
 from app.user_memory import get_user_memory
+from app.intent import get_intent_layer
 from app.rag.embeddings import EmbeddingClient
 from app.rag.hybrid import BM25Index, rrf_fuse
 from app.rag.llm import LLMClient
@@ -28,27 +29,9 @@ from app.rag.vectorstore import get_vector_store
 
 log = get_logger("rag.pipeline")
 
-STOPWORDS = ["我想问", "请问", "帮我", "怎么", "如何", "怎么办", "吗", "呢", "？", "?", "。", "居民", "社区", "小区"]
-
-# 社区治理 / 矛盾调解领域的核心关键词（命中则优先判定为域内问题）
-GOVERNANCE_KEYWORDS = [
-    "邻居", "邻里", "漏水", "噪音", "噪声", "停车", "车位", "地锁", "宠物", "狗", "猫",
-    "物业", "物业费", "业委会", "业主大会", "维修基金", "绿地", "违建", "搭建",
-    "油烟", "装修", "扰民", "垃圾", "环境", "路灯", "充电桩", "电梯", "群租",
-    "出租", "房东", "租客", "租户", "赡养", "抚养", "家暴", "家庭暴力", "纠纷",
-    "调解", "矛盾", "投诉", "维权", "居委会", "村委会", "网格员", "社区", "小区",
-    "业主", "住户", "公共区域", "共有部分", "采光", "通风", "排水", "排污",
-]
-
-# 明显离域的生活 / 娱乐 / 工具类诉求（命中且无治理关键词 → 直接判定为超出范围）
-OFF_DOMAIN_KEYWORDS = [
-    "ktv", "k歌", "唱歌", "歌厅", "酒吧", "电影", "追剧", "电视剧", "综艺",
-    "旅游", "景点", "景区", "爬山", "美食", "餐厅", "饭店", "外卖", "奶茶",
-    "快递", "打车", "滴滴", "出租车", "导航", "地图", "天气", "股票", "基金",
-    "彩票", "炒币", "游戏", "王者", "原神", "购物", "淘宝", "京东", "拼多多",
-    "演唱会", "酒店", "机票", "火车票", "高铁票", "笑话", "算命", "运势", "星座",
-    "八卦", "新闻", "翻译", "写代码", "编程",
-]
+# 注意：以下中文关键词 / 正则已全部迁入 backend/app/intents.yaml（意图识别配置中心）。
+# 本文件只保留“逻辑”，所有“数据”由 IntentLayer 从 intents.yaml 加载。
+# 改词 / 加词请直接编辑 intents.yaml，无需改动此文件。
 
 
 class RAGPipeline:
@@ -75,6 +58,8 @@ class RAGPipeline:
         self._profiles = get_profile_store()
         # 用户级长期记忆（B 方案）：跨 session 跨角色的 question_log + 角色维度的专业档案
         self._user_mem = get_user_memory()
+        # 意图识别统一层（关键词/正则全在 intents.yaml，此方法只做匹配）
+        self.intents = get_intent_layer()
 
     def rebuild_bm25(self):
         """用向量库当前全部 payload 重建稀疏索引，使其与检索源完全一致。
@@ -90,23 +75,7 @@ class RAGPipeline:
             log.warning("BM25 重建失败：%s", e)
             self.bm25._built = False
     def _supervise(self, question: str, has_history: bool = False) -> str:
-        q = question.strip()
-        ql = q.lower()
-        greet = ["你好", "您好", "hi", "hello", "在吗", "谢谢", "感谢"]
-        if any(g in ql for g in greet) and len(q) <= 12:
-            return "direct"
-        if any(k in q for k in ["你是谁", "你是什么", "你能干", "你会", "介绍下你", "怎么用"]):
-            return "direct"
-        # 有历史时，短句多为对上一轮追问的回答（如"好几天了""是的"），继续走检索而非再次澄清
-        if len(q) < 4:
-            return "retrieve" if has_history else "clarify"
-        # 领域判断：命中治理关键词 → 域内（走检索）；
-        # 仅命中离域关键词、且无治理关键词 → 超出服务范围（不检索）
-        hit_governance = any(k in ql for k in GOVERNANCE_KEYWORDS)
-        hit_off_domain = any(k in ql for k in OFF_DOMAIN_KEYWORDS)
-        if hit_off_domain and not hit_governance:
-            return "out_of_domain"
-        return "retrieve"
+        return self.intents.supervise(question, has_history)
 
     def _direct_answer(self) -> str:
         return (
@@ -170,39 +139,16 @@ class RAGPipeline:
 
     # ---------- Retrieval + Self-RAG ----------
     def _reformulate(self, query: str) -> str:
-        q = query
-        for w in STOPWORDS:
-            q = q.replace(w, "")
-        return q.strip() or query
+        return self.intents.reformulate(query)
 
     # ---------- Query Decomposition（复杂纠纷分步检索合并） ----------
     def _should_decompose(self, question: str) -> bool:
         """启发式判断是否需查询分解：仅对「复杂、多子问题」的检索类问题开启。
 
         避免简单问题被无谓拆分（多一次 LLM 调用 + 多次检索，反而变慢变贵）。
+        关键词与阈值在 intents.yaml 的 decompose 段配置。
         """
-        q = question.strip()
-        # 调试用：触发条件详情（重启后看 logs/app.log 即可判断为什么没拆）
-        log.info("[decompose-debug] q_len=%d qmark=%d qwords=%d | q=%r",
-                 len(q), q.count("?") + q.count("？"),
-                 q.count("怎么办") + q.count("怎么") + q.count("如何") + q.count("怎样") + q.count("咋"),
-                 q[:50])
-        if len(q) < 36:
-            return False
-        # 多个问号
-        if q.count("?") + q.count("？") >= 2:
-            return True
-        # 多个疑问词（怎么/如何/怎么办/怎样/咋）
-        qwords = q.count("怎么办") + q.count("怎么") + q.count("如何") + q.count("怎样") + q.count("咋")
-        if qwords >= 2:
-            return True
-        # 并列诉求（连词 + 赔偿/程序/处理等）
-        conj = ["还有", "另外", "以及", "同时", "除此之外", "此外", "并且", "加", "和"]
-        if any(c in q for c in conj) and any(
-            k in q for k in ("赔偿", "怎么办", "怎么", "程序", "处理", "主张", "如何")
-        ):
-            return True
-        return False
+        return self.intents.should_decompose(question)
 
     @staticmethod
     def _parse_json_list(raw: str) -> list:
@@ -541,21 +487,9 @@ class RAGPipeline:
         默认 'resident'
         命中调解/社区工作口吻则判定为 'mediator'；命中物业职责口吻为 'property'。
         多轮场景下把历史用户话合并判断，避免碎片化追答丢失身份。
+        关键词在 intents.yaml 的 role 段配置。
         """
-        q = question
-        if history:
-            q = " ".join([m["content"] for m in history if m["role"] == "user"]) + " " + question
-        if any(k in q for k in [
-            "接案", "接到投诉", "受理登记", "如何调解", "怎么调解", "调解流程",
-            "组织座谈", "上门走访", "回访", "调处", "社区工作站", "网格员", "网格",
-        ]):
-            return "mediator"
-        if any(k in q for k in [
-            "物业怎么", "作为物业", "物业如何", "管家", "巡查记录", "物业上报", "工程维修单",
-        ]):
-            return "property"
-        # 居民 / 当事人 / 投诉人（含显式自述或默认）
-        return "resident"
+        return self.intents.infer_role(question, history)
 
     def _role_guidance(self, role: str, known_facts: dict[str, str] | None = None) -> str:
         """按角色返回生成约束，嵌进 _generate 的提示词。"""
@@ -603,28 +537,7 @@ class RAGPipeline:
         )
 
     # ---------- 已知事实提取（防止重复追问已回答的信息） ----------
-    # 常见关键事实维度 + 对应的口语关键词（覆盖居民常用表达方式）
-    _FACT_DIMENSIONS = {
-        "起止时间": ["几点", "几点钟", "早上", "中午", "下午", "晚上", "凌晨", "半夜",
-                    "深夜", "从.*点", "到.*点", "开始.*搞", "搞到", "持续到",
-                    "一直搞到", "搞到.*才", "从.*开始", "到.*结束", "到.*才停",
-                    "上午", "傍晚", "夜里", "通宵", "整晚"],
-        "持续时间/频率": ["持续", "多久", "几天", "几个月", "好久了", "一直", "经常",
-                     "天天", "每天", "每晚", "偶尔", "一次", "频率", "频次",
-                     "又开始了", "还是照样", "照旧", "依旧"],
-        "是否已沟通": ["沟通过", "找过他", "说过", "跟他讲", "找过楼上", "找过对方",
-                      "找过邻居", "反映过", "跟他说了", "交涉", "协商", "找过.*毛"],
-        "沟通结果/对方态度": ["不改", "不听", "不理", "骂回来", "态度差", "不认",
-                             "推脱", "敷衍", "答应但没做", "口头答应", "没用", "无效",
-                             "照样", "没改", "照旧", "依旧", "还是照样", "还是不改"],
-        "是否找过物业/社区": ["物业", "管家", "管理处", "居委会", "社区", "调解员",
-                            "报警", "派出所", "110", "12345", "街道"],
-        "证据情况": ["录音", "录像", "视频", "拍照", "截图", "聊天记录", "微信",
-                    "留证", "证据", "拍下来", "录下来"],
-        "影响程度": ["睡不着", "睡不好", "影响休息", "影响学习", "小孩", "孩子",
-                    "老人", "病人", "神经衰弱", "精神", "质量差"],
-    }
-
+    # 各维度关键词已迁入 intents.yaml 的 fact_dimensions 段，由 IntentLayer 加载。
     def _extract_known_facts(self, history: list[dict] | None, current_question: str = "") -> dict[str, str]:
         """扫描对话历史 + 当前用户输入，提取已透露的关键事实。
 
@@ -640,8 +553,6 @@ class RAGPipeline:
         # 逐轮扫描用户发言（保留自然句边界），从最近往前找
         # 特殊处理：起止时间维度需要" richest match"——
         #   "从9点开始搞到凌晨" >> "天天晚上搞"，所以不能首匹配即停。
-        _TIME_RICH_KEYWORDS = ("从.*点", "到.*点", "开始.*搞", "搞到", "持续到",
-                               "一直搞到", "\\d+点", "\\d+:\\d+", "整晚", "通宵", "彻夜")
         time_candidates: list[str] = []  # 收集所有起止时间候选，最后选最丰富的
 
         for m in reversed(all_user_msgs):
@@ -654,7 +565,7 @@ class RAGPipeline:
                 sent = sent.strip()
                 if len(sent) < 4:
                     continue
-                for dim, keywords in self._FACT_DIMENSIONS.items():
+                for dim, keywords in self.intents.fact_dimensions.items():
                     if dim == "起止时间":
                         # 起止时间：收集所有候选不截断，后面统一选最优
                         for kw in keywords:
