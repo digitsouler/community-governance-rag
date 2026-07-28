@@ -298,7 +298,39 @@ class Handler(BaseHTTPRequestHandler):
             ok_in, reason, has_pii = gr.scan_input(question)
             if not ok_in:
                 log.warning("[%s] 输入被护栏拦截 | reason=%s | user=%s", req_id, reason, user_id)
-                audit("blocked_input", trace_id=req_id, user_id=user_id, ip=ip, reason=reason)
+                audit("blocked_input", trace_id=req_id, user_id=user_id, ip=ip, reason=reason,
+                      session_id=session_id, role=user_role or "")
+                safety_answer = gr.safety_response(reason)
+                if safety_answer:
+                    # 高风险意图使用确定性文案直接短路：不检索、不调模型、不写语义缓存。
+                    # 返回 200 让聊天前端按正常 AI 消息展示劝阻，而不是只弹一个错误。
+                    if session_id:
+                        store = get_session_store()
+                        sess = store.get_session(session_id)
+                        if sess is None or (sess.get("owner") and sess.get("owner") != user_id):
+                            self._send(404, error_payload("会话不存在", req_id, 404), trace_id=req_id)
+                            return
+                        store.append_message(session_id, "user", question)
+                        store.append_message(session_id, "assistant", safety_answer)
+                    else:
+                        session_id = get_session_store().create_session(owner=user_id)
+                        get_session_store().append_message(session_id, "user", question)
+                        get_session_store().append_message(session_id, "assistant", safety_answer)
+                    self._send(200, {
+                        "answer": safety_answer,
+                        "route": "safety_block",
+                        "sources": [],
+                        "self_rag_retries": 0,
+                        "model": "gateway-guardrail",
+                        "latency_ms": 0,
+                        "case_profile": None,
+                        "trace": {"steps": [{"name": "safety_guardrail", "detail": f"reason={reason}"}]},
+                        "trace_id": req_id,
+                        "session_id": session_id,
+                        "blocked": True,
+                        "block_reason": reason,
+                    }, trace_id=req_id)
+                    return
                 self._send(400, error_payload("输入含不安全内容，已被拦截", req_id, 400), trace_id=req_id)
                 return
 

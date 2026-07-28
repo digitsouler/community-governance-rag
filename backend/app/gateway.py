@@ -134,6 +134,37 @@ INJECTION_PATTERNS = [
 ]
 _INJ_RE = [re.compile(p, re.I) for p in INJECTION_PATTERNS]
 
+# 高风险意图：只有「实施/准备实施的动作倾向」与「严重伤害手段或目标」同时出现才拦截。
+# 单纯讨论新闻、法律责任、调解案例中的“枪炮战火”等词，不应仅凭关键词误伤。
+HARM_ACTION_RE = re.compile(
+    r"(我想|我要|我准备|我打算|计划|决定|马上|现在就|帮我|教我|告诉我怎么|如何|怎么).{0,18}"
+    r"(杀|砍|捅|打死|弄死|炸|放火|纵火|枪击|袭击|报复|投毒|绑架|制造爆炸|发动战争|实施犯罪|搞大事)"
+    r"|"
+    r"(杀|砍|捅|打死|弄死|炸|放火|纵火|枪击|袭击|报复|投毒|绑架|制造爆炸|发动战争|实施犯罪|搞大事).{0,18}"
+    r"(怎么办|怎么做|步骤|方法|计划|方案|工具|材料)",
+    re.I,
+)
+SELF_HARM_RE = re.compile(
+    r"(不想活|活不下去|结束生命|自杀|轻生|跳楼|割腕|服毒|寻死|去死).{0,20}"
+    r"(我|自己|本人|现在|马上|准备|打算|想|要|方法|怎么)",
+    re.I,
+)
+
+HIGH_RISK_RESPONSES = {
+    "violent_intent": (
+        "我不能帮助策划、实施或美化伤害他人、枪击、纵火、爆炸、恐怖袭击或其他犯罪行为。"
+        "请立即停止当前行动，远离武器、易燃易爆物和可能受伤的人，不要单独处理。"
+        "如果存在现实紧迫危险，请马上拨打 110；如有人受伤，请同时拨打 120。"
+        "可以先联系一位可信任的家人、同事或社区负责人陪同，并只描述冲突事实，我可以继续帮你整理一份合法、安全的降温和求助步骤。"
+    ),
+    "self_harm": (
+        "我很重视你现在的安全，但不能帮助提供自伤或结束生命的方法。"
+        "请先远离可能伤害自己的物品和高处，尽快联系一位可信任的人陪在身边。"
+        "如果你正准备行动或无法保证自己安全，请立即拨打 110 或 120，或直接前往最近的急诊。"
+        "你也可以只告诉我：你现在是否安全、身边是否有人，我会继续陪你把下一步求助安排清楚。"
+    ),
+}
+
 PII_PHONE = re.compile(r"(?<![\d.])(1[3-9]\d)\d{4}(\d{4})(?![\d.])")
 PII_IDCARD = re.compile(r"(?<![\d.])\d{6}(\d{8})\d{4}(?![\d.])")
 PII_EMAIL = re.compile(r"([a-zA-Z0-9_.]{1,3})[a-zA-Z0-9_.]*@([a-zA-Z0-9_.-]+\.[a-zA-Z]{2,})")
@@ -148,10 +179,19 @@ class Guardrails:
         if not self.enabled:
             return True, None, False
         has_pii = bool(PII_PHONE.search(text) or PII_IDCARD.search(text) or PII_EMAIL.search(text))
+        if SELF_HARM_RE.search(text):
+            return False, "self_harm", has_pii
+        if HARM_ACTION_RE.search(text):
+            return False, "violent_intent", has_pii
         for rx in _INJ_RE:
             if rx.search(text):
                 return False, "prompt_injection", has_pii
         return True, None, has_pii
+
+    @staticmethod
+    def safety_response(reason: Optional[str]) -> Optional[str]:
+        """高风险意图返回确定性劝阻文案；prompt 注入等普通阻断仍返回 None。"""
+        return HIGH_RISK_RESPONSES.get(reason or "")
 
     def redact(self, text: str) -> str:
         if not (self.enabled and _s.pii_redact_enabled):
