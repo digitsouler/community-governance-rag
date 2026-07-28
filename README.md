@@ -23,7 +23,10 @@
 
 30 秒看完整流程：选身份 → 提问 → **自动拆复杂问题** → **流式答 + 引用溯源** → 知识库后台 → 切模型。
 
-<video src="./assets/demo.mp4" controls width="100%"></video>
+<p align="center">
+  <a href="./assets/demo.mp4"><img src="./assets/demo-poster.png" alt="点击查看 30 秒产品演示" width="900"></a>
+</p>
+<p align="center"><sub>👆 点击封面在新标签页播放（GitHub README 对 video 标签的渲染不稳定，封面图方案更稳）</sub></p>
 
 ---
 
