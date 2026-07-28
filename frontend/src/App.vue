@@ -39,8 +39,11 @@ function updateProfile(p) {
 }
 async function loadProfile(sid) {
   if (!sid) { caseProfile.value = null; return }
+  // B 方案：按 (user_id, role) 拉取用户级长期记忆的案件档案（跨 session 共享）
+  const role = userRole.value || ''
+  const url = '/api/sessions/' + encodeURIComponent(sid) + '/profile' + (role ? ('?role=' + encodeURIComponent(role)) : '')
   try {
-    const r = await fetch('/api/sessions/' + encodeURIComponent(sid) + '/profile', { headers: AUTH })
+    const r = await fetch(url, { headers: AUTH })
     const d = await r.json()
     caseProfile.value = (d.profile && Object.keys(d.profile).length) ? d.profile : null
   } catch (e) { caseProfile.value = null }

@@ -19,6 +19,7 @@ from typing import Any
 from app.config import ProviderName, Settings, get_settings
 from app.log import get_logger
 from app.profile_store import get_profile_store
+from app.user_memory import get_user_memory
 from app.rag.embeddings import EmbeddingClient
 from app.rag.hybrid import BM25Index, rrf_fuse
 from app.rag.llm import LLMClient
@@ -72,6 +73,8 @@ class RAGPipeline:
             self.bm25._built = False
         # 长期记忆（P1）：结构化案件档案存储（Redis 优先，内存降级）
         self._profiles = get_profile_store()
+        # 用户级长期记忆（B 方案）：跨 session 跨角色的 question_log + 角色维度的专业档案
+        self._user_mem = get_user_memory()
 
     def rebuild_bm25(self):
         """用向量库当前全部 payload 重建稀疏索引，使其与检索源完全一致。
@@ -255,14 +258,16 @@ class RAGPipeline:
             return []
 
     # ---------- 对外接口 ----------
-    def query(self, question, provider=None, history=None, session_id=None, stream=False, user_role=None):
+    def query(self, question, provider=None, history=None, session_id=None, stream=False, user_role=None, user_id=None):
         """统一入口。
 
         stream=False → 返回完整结果 dict（兼容旧调用 / 评测脚本）；
         stream=True  → 返回生成器，逐条 yield SSE 事件
                       {"type": "route"|"delta"|"done"|"error", ...}。
+        user_id 用于 B 方案的"用户级长期记忆"：question_log 跨 session 跨角色共享，
+        案件档案按 (user_id, role) 隔离。
         """
-        gen = self._run(question, provider, history, session_id, user_role=user_role)
+        gen = self._run(question, provider, history, session_id, user_role=user_role, user_id=user_id)
         if stream:
             return gen
         final = None
@@ -271,7 +276,7 @@ class RAGPipeline:
                 final = ev["result"]
         return final
 
-    def _run(self, question, provider, history, session_id, user_role: str | None = None):
+    def _run(self, question, provider, history, session_id, user_role: str | None = None, user_id: str | None = None):
         """内部生成器：逐步执行管道并 yield 事件，供流式输出复用。"""
         import random
         trace_id = uuid.uuid4().hex[:12]
@@ -410,7 +415,33 @@ class RAGPipeline:
 
         role = self._resolve_role(user_role, question, history)
         mark("infer_role", f"role={role}")
-        case_profile = self._profiles.get(session_id) if session_id else None
+        # B 方案：案件档案按 (user_id, role) 隔离 —— 同一角色跨 session 共享专业记忆，跨角色不串
+        # 兼容旧逻辑：当 user_id 缺失时回退到原 session_id 键
+        if user_id:
+            case_profile = self._user_mem.get_profile(user_id, role)
+        else:
+            case_profile = self._profiles.get(session_id) if session_id else None
+
+        # B 方案：检测"回忆类"问题 → 跳过 RAG，直接基于用户级 question_log 用 LLM 总结
+        # 例：「我刚才问了什么」「之前/上次问过什么」「我最近问过什么」
+        recall = self._maybe_recall(question, user_id, role) if user_id else None
+        if recall:
+            t_re = time.perf_counter()
+            mark("recall_match", "命中回忆关键词 → 跳过 RAG，直接基于 question_log 生成")
+            yield {"type": "route", "route": "recall", "trace_id": trace_id, "session_id": session_id,
+                   "steps": list(steps)}
+            answer_parts: list[str] = []
+            for delta in self._generate_recall_answer(question, recall, provider):
+                answer_parts.append(delta)
+                yield {"type": "delta", "text": delta}
+            answer = "".join(answer_parts).strip()
+            steps.append({"stage": "generate", "detail": f"mode=recall 字数={len(answer)}",
+                          "ms": round((time.perf_counter() - t_re) * 1000, 1)})
+            wrapped = self._wrap(trace_id, steps, t_total, "recall", answer, [], 0, provider,
+                                 user_role=role, case_profile=None, decomposition=None)
+            wrapped["session_id"] = session_id
+            yield {"type": "done", "result": wrapped}
+            return
 
         # 检索链路已就绪，先把「路由 + 已完成步骤」推给前端（首字前可见骨架）
         yield {"type": "route", "route": "retrieve", "trace_id": trace_id, "session_id": session_id,
@@ -419,7 +450,7 @@ class RAGPipeline:
         # 流式生成答案（首字即可见，体感远快于等整段）
         answer_parts: list[str] = []
         t_gen = time.perf_counter()
-        for delta in self._generate_stream(question, ranked, provider, trace_id, role=role, history=history, profile=case_profile, decomposed=decomposition["enabled"]):
+        for delta in self._generate_stream(question, ranked, provider, trace_id, role=role, history=history, profile=case_profile, decomposed=decomposition["enabled"], recall=recall):
             answer_parts.append(delta)
             yield {"type": "delta", "text": delta}
         answer = "".join(answer_parts)
@@ -431,7 +462,14 @@ class RAGPipeline:
                       "ms": round((time.perf_counter() - t_gen) * 1000, 1)})
 
         # 本轮结束后更新并持久化案件档案（合并累积，不丢历史事实）
-        if session_id:
+        # B 方案：按 (user_id, role) 键保存，使同一角色跨 session 共享专业记忆
+        if user_id:
+            existing = case_profile or {}
+            fresh = self._build_case_profile(history, question, role)
+            merged = self._merge_profile(existing, fresh)
+            self._user_mem.save_profile(user_id, role, merged)
+            case_profile = merged
+        elif session_id:
             existing = case_profile or {}
             fresh = self._build_case_profile(history, question, role)
             merged = self._merge_profile(existing, fresh)
@@ -731,6 +769,104 @@ class RAGPipeline:
                         asked.append(q)
         return asked
 
+    # ---------- B 方案：用户级 question_log 回忆注入 ----------
+    # 「我刚才问了什么」「之前/上次问过什么」「我最近问过什么」类问题
+    # → 拉取用户级最近提问索引，注入 prompt 让 AI 据此作答
+    _RECALL_KEYWORDS = [
+        "刚才问了什么", "刚才问过", "刚才提过", "刚才说",
+        "之前问了", "之前问过", "之前提过",
+        "上次问了", "上次问过", "上次提过",
+        "最近问了", "最近问过", "最近提过",
+        "我问过什么", "我问过啥", "我问过哪些",
+        "我之前问了", "我刚才问", "我之前问",
+        "我最近问", "我上轮问", "我前面问",
+        "我提过什么", "我提过啥", "我说过什么",
+        "有没有问过", "问过什么", "问过哪些",
+        "记得我问过", "记得我", "我们聊过", "之前聊过",
+    ]
+
+    def _maybe_recall(self, question: str, user_id: str, role: str) -> str | None:
+        """检测「回忆类」问题并返回要注入 prompt 的块（无命中返回 None）。
+
+        实现要点：
+        1. 关键词匹配判定（轻量、不调 LLM）
+        2. 跨 session 跨角色取最近 10 条（role 维度与当前不一致时同时标注）
+        3. 提示 AI 必须基于【用户最近问过】块作答，引用时可指明角色/时间
+        """
+        if not user_id:
+            return None
+        q = (question or "").strip()
+        if not q or len(q) > 60:
+            # 回忆类问题通常很短（"我刚才问了什么" 类）；过长不算
+            return None
+        hit = any(kw in q for kw in self._RECALL_KEYWORDS)
+        if not hit:
+            return None
+        items = self._user_mem.get_recent_questions(user_id, role=None, n=10)
+        if not items:
+            return (
+                "【用户最近问过】\n"
+                "（这是该用户本轮会话之外的提问记录，目前还没有任何记录。）\n"
+                "请直接告诉用户：暂时还没有跨会话的提问记录。"
+            )
+        lines: list[str] = []
+        for it in items:
+            ts = it.get("ts") or 0
+            r = it.get("role") or "未指定"
+            preview = it.get("preview") or it.get("question") or ""
+            try:
+                import datetime as _dt
+                tstr = _dt.datetime.fromtimestamp(ts).strftime("%m-%d %H:%M")
+            except Exception:
+                tstr = "时间未知"
+            lines.append(f"  - [{tstr}] 以【{r}】身份：{preview}")
+        block = (
+            "【用户最近问过（跨 session 跨角色汇总，按时间倒序，最多 10 条）】\n"
+            + "\n".join(lines)
+            + "\n"
+            "请基于以上记录直接告诉用户他/她之前问过什么；"
+            "如用户限定了角色视角，优先呈现该角色的记录，并在引用时简短说明来源（时间/角色）。"
+        )
+        return block
+
+    def _generate_recall_answer(self, question: str, recall_block: str, provider: str):
+        """回忆类问题的生成器：跳过 RAG，直接基于 question_log 用 LLM 总结回答。
+
+        失败时回退到 question_log 模板化摘要，保证用户至少看到记录原文。
+        """
+        system = (
+            "你是社区矛盾调解助理。用户问的是「我之前/刚才问过什么」类问题。"
+            "请严格基于下方【用户最近问过】记录，用 2-5 句自然语言告诉用户他/她最近问过什么；"
+            "可以按时间倒序列出 1-3 条要点（每条一句话概括），并简短注明对应角色/时间；"
+            "如果记录显示「目前还没有任何记录」，直接告诉用户暂未记录到他/她的提问即可。"
+            "严禁编造记录中不存在的内容；如对记录不明确，承认即可。"
+        )
+        user = f"用户问题：{question}\n\n{recall_block}"
+        # 模板回退（mock / LLM 失败时使用）
+        def _fallback():
+            return (
+                "根据我的记忆，"
+                + recall_block.replace("【用户最近问过（跨 session 跨角色汇总，按时间倒序，最多 10 条）】\n", "")
+                .replace("（这是该用户本轮会话之外的提问记录，目前还没有任何记录。）\n请直接告诉用户：暂时还没有跨会话的提问记录。",
+                         "暂未记录到您之前的提问。")
+            )
+        if self.s.mock:
+            yield _fallback()
+            return
+        try:
+            buf: list[str] = []
+            for delta in self.llm.stream_chat(
+                [{"role": "system", "content": system}, {"role": "user", "content": user}],
+                provider=provider, temperature=0.2,
+            ):
+                buf.append(delta)
+                yield delta
+            if not "".join(buf).strip():
+                yield _fallback()
+        except Exception as e:  # noqa: BLE001
+            log.warning("回忆回答 LLM 失败，回退模板: %s", e)
+            yield _fallback()
+
     # ---------- 长期记忆（P1）：结构化案件档案 ----------
     _CASE_TYPE_MAP = {
         "噪音纠纷": ["噪音", "噪声", "装修", "扰民", "嗡嗡", "施工", "吵"],
@@ -823,10 +959,11 @@ class RAGPipeline:
         merged["updated_at"] = time.time()
         return merged
 
-    def _generate_stream(self, question: str, sources: list[dict], provider: str, trace_id: str, role: str = "resident", history: list[dict] | None = None, profile: dict | None = None, decomposed: bool = False):
+    def _generate_stream(self, question: str, sources: list[dict], provider: str, trace_id: str, role: str = "resident", history: list[dict] | None = None, profile: dict | None = None, decomposed: bool = False, recall: str | None = None):
         """流式生成：逐块 yield 文本增量（mock 模式下整段一次性 yield）。
 
         纯感谢短路已上移到 _run，入口保证不会传入纯客套消息。
+        recall：B 方案的用户级 question_log 注入块（回忆类问题才非空）
         """
         ctx_blocks = []
         for i, s in enumerate(sources, 1):
@@ -875,6 +1012,10 @@ class RAGPipeline:
                 f"以上问题你已经在前面问过用户了，重复提问会让用户觉得你不专业、"
                 f"没有在听。直接基于已有信息给建议，或问一个全新的、从未问过的角度。\n"
             )
+        # B 方案：用户级 question_log 回忆块（跨 session/跨角色汇总）
+        recall_block = ""
+        if recall:
+            recall_block = f"\n{recall}\n"
         # 长期记忆（P1）：把已沉淀的结构化案件档案作为「事实源」注入，
         # 即使原始多轮对话被上下文窗口截断，AI 仍依据真实事实作答，不瞎编。
         profile_block = ""
@@ -927,7 +1068,7 @@ class RAGPipeline:
         prompt = (
             "你是社区矛盾调解助理，必须严格基于下方「相关资料」作答。\n"
             f"本次对话识别到的【用户身份】={role_label}\n{role_g}"
-            f"{fact_block}{asked_block}{profile_block}"
+            f"{fact_block}{asked_block}{profile_block}{recall_block}"
             f"{gratitude_override}{decomp_guidance}"
             "硬性要求：\n"
             "1) 只使用资料中【明确出现】的事实、法条、调解步骤；严禁自行补充资料未提及的法律结论、"

@@ -41,6 +41,7 @@ from app.config import MODEL_REGISTRY, get_settings
 from app.log import get_logger, setup_logging
 from app.rag.pipeline import RAGPipeline
 from app.profile_store import get_profile_store
+from app.user_memory import get_user_memory
 from app.session_store import get_session_store
 from app.gateway import (
     resolve_user,
@@ -166,6 +167,7 @@ class Handler(BaseHTTPRequestHandler):
             self._send(200, {"status": "ok", "session": sess,
                              "messages": get_session_store().get_messages(sid)})
         # 会话：结构化案件档案（长期记忆）
+        # B 方案：优先按 (user_id, role) 查用户级长期记忆；role 缺省时回退 sid-keyed（兼容旧版）
         elif path.startswith("/api/sessions/") and path.endswith("/profile"):
             sid = unquote(path.split("/")[3])
             user_id = resolve_user(self.headers, self.client_address[0])
@@ -173,7 +175,12 @@ class Handler(BaseHTTPRequestHandler):
             if sess is None or (sess.get("owner") and sess.get("owner") != user_id):
                 self._send(404, {"error": "会话不存在"})
                 return
-            prof = get_profile_store().get(sid)
+            qs = parse_qs(urlparse(self.path).query)
+            role = (qs.get("role", [""])[0] or "").strip()
+            if role:
+                prof = get_user_memory().get_profile(user_id, role)
+            else:
+                prof = get_profile_store().get(sid)
             self._send(200, {"status": "ok", "session_id": sid, "profile": prof})
         else:
             self._send(404, {"error": "not found"})
@@ -197,7 +204,7 @@ class Handler(BaseHTTPRequestHandler):
                 log.warning("[%s] SSE 写出失败: %s", req_id, e)
 
         try:
-            for ev in pipeline.query(question, provider, history=history, session_id=session_id, stream=True, user_role=user_role or None):
+            for ev in pipeline.query(question, provider, history=history, session_id=session_id, stream=True, user_role=user_role or None, user_id=user_id):
                 if ev.get("type") == "delta":
                     emit(ev)
                 elif ev.get("type") == "route":
@@ -208,6 +215,11 @@ class Handler(BaseHTTPRequestHandler):
                     res["session_id"] = session_id
                     answer = gr.redact(res["answer"])  # ⑤ 输出护栏：PII 脱敏
                     get_semantic_cache().put(question, answer, has_pii)  # ④ 回填语义缓存
+                    # B 方案：写入用户级 question_log（跨 session/跨角色汇总）
+                    try:
+                        get_user_memory().record_question(user_id, session_id, user_role or "", question)
+                    except Exception as _e:
+                        log.warning("[%s] question_log 写入失败: %s", req_id, _e)
                     emit({
                         "type": "done",
                         "answer": answer,
@@ -340,12 +352,17 @@ class Handler(BaseHTTPRequestHandler):
                 if use_stream:
                     self._stream_chat(session_id, question, provider, history, req_id, user_id, ip, has_pii, user_role=user_role or None)
                     return
-                result = pipeline.query(question, provider, history=history, session_id=session_id, user_role=user_role or None)
+                result = pipeline.query(question, provider, history=history, session_id=session_id, user_role=user_role or None, user_id=user_id)
                 result["trace_id"] = result.get("trace_id", req_id)
                 result["answer"] = gr.redact(result["answer"])  # ⑤ 输出护栏：PII 脱敏
                 store.append_message(session_id, "assistant", result["answer"])
                 result["session_id"] = session_id
                 get_semantic_cache().put(question, result["answer"], has_pii)  # ④ 回填语义缓存
+                # B 方案：写入用户级 question_log（跨 session/跨角色汇总）
+                try:
+                    get_user_memory().record_question(user_id, session_id, user_role or "", question)
+                except Exception as _e:
+                    log.warning("[%s] question_log 写入失败: %s", req_id, _e)
                 audit("chat", trace_id=req_id, user_id=user_id, ip=ip, session_id=session_id,
                       route=result["route"], model=result["model"], latency_ms=result["latency_ms"])
                 self._send(200, result, trace_id=result["trace_id"])
