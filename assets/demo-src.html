@@ -1,0 +1,274 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0" />
+<title>社区矛盾调解 RAG 助手 · 演示</title>
+<style>
+  :root{
+    --primary:#0e7490; --accent:#0891b2; --ink:#0f172a; --muted:#64748b;
+    --line:#e2e8f0; --bg:#f1f5f9; --user1:#2563eb; --user2:#1d4ed8;
+  }
+  *{box-sizing:border-box;}
+  html,body{margin:0;height:100%;}
+  body{
+    font-family:-apple-system,BlinkMacSystemFont,"Segoe UI","Microsoft YaHei",sans-serif;
+    background:radial-gradient(1200px 600px at 50% -10%,#dbeafe,#eef2f6 60%);
+    display:flex;align-items:center;justify-content:center;color:var(--ink);
+  }
+  /* ---------- 浏览器外框 ---------- */
+  .window{
+    width:1180px;height:730px;background:#fff;border-radius:14px;overflow:hidden;
+    box-shadow:0 30px 80px rgba(15,23,42,.25),0 4px 12px rgba(15,23,42,.12);
+    display:flex;flex-direction:column;
+    opacity:0;animation:winIn .8s .1s both;
+  }
+  @keyframes winIn{from{opacity:0;transform:translateY(14px) scale(.985)}to{opacity:1;transform:none}}
+  .titlebar{
+    height:42px;background:#f8fafc;border-bottom:1px solid var(--line);
+    display:flex;align-items:center;gap:14px;padding:0 16px;flex:0 0 auto;
+  }
+  .dots{display:flex;gap:8px;}
+  .dots i{width:12px;height:12px;border-radius:50%;display:block;}
+  .dots i:nth-child(1){background:#ff5f57}.dots i:nth-child(2){background:#febc2e}.dots i:nth-child(3){background:#28c840}
+  .urlbar{
+    flex:1;height:26px;background:#fff;border:1px solid var(--line);border-radius:13px;
+    display:flex;align-items:center;padding:0 12px;color:var(--muted);font-size:12.5px;gap:8px;
+  }
+  .urlbar b{color:#16a34a;font-weight:600}
+  /* ---------- App 头部 ---------- */
+  .app{flex:1;display:flex;flex-direction:column;min-height:0;}
+  .app-header{padding:14px 20px 0;background:#fff;}
+  .brand{display:flex;align-items:baseline;gap:10px;}
+  .brand h1{font-size:19px;margin:0;letter-spacing:.3px;}
+  .brand span{font-size:12.5px;color:var(--muted);}
+  .header-bar{
+    display:flex;align-items:center;justify-content:space-between;
+    margin-top:12px;border-bottom:1px solid var(--line);padding-bottom:8px;
+  }
+  .tabs{display:flex;gap:6px;}
+  .tab{
+    font-size:14px;padding:7px 14px;border-radius:9px 9px 0 0;color:var(--muted);
+    cursor:default;background:transparent;border:1px solid transparent;border-bottom:none;
+  }
+  .controls{display:flex;gap:10px;align-items:center;}
+  .ctl{
+    font-size:13px;color:#334155;background:#f8fafc;border:1px solid var(--line);
+    padding:7px 12px;border-radius:9px;display:flex;align-items:center;gap:6px;
+  }
+  .ctl .ar{color:var(--muted);font-size:10px;}
+  /* tab 激活态随时间切换（总时长 28s）*/
+  .tab.kb{animation:tabKb 28s both;}
+  .tab.chat{animation:tabChat 28s both;}
+  @keyframes tabKb{0%,71%{color:var(--muted);background:transparent}
+    73%,82%{color:var(--primary);background:#ecfeff;border-color:var(--line)}
+    84%,100%{color:var(--muted);background:transparent}}
+  @keyframes tabChat{0%,71%{color:var(--primary);background:#ecfeff;border-color:var(--line)}
+    73%,82%{color:var(--muted);background:transparent;border-color:transparent}
+    84%,100%{color:var(--primary);background:#ecfeff;border-color:var(--line)}}
+  /* ---------- 视图区 ---------- */
+  .views{flex:1;position:relative;min-height:0;overflow:hidden;}
+  .chat-panel,.kb-panel{position:absolute;inset:0;}
+  .chat-panel{animation:chatVis 28s both;}
+  .kb-panel{animation:kbVis 28s both;}
+  @keyframes chatVis{0%,71%{opacity:1;transform:none}
+    73%,82%{opacity:0;transform:translateX(-14px)}84%,100%{opacity:1;transform:none}}
+  @keyframes kbVis{0%,71%{opacity:0;transform:translateX(14px)}
+    73%,82%{opacity:1;transform:none}84%,100%{opacity:0;transform:translateX(14px)}}
+  /* ---------- 角色选择弹层 ---------- */
+  .role-modal{
+    position:absolute;inset:0;background:rgba(241,245,249,.86);backdrop-filter:blur(3px);
+    display:flex;align-items:center;justify-content:center;z-index:5;
+    animation:modalOut .6s 6.0s both;
+  }
+  @keyframes modalOut{from{opacity:1}to{opacity:0;visibility:hidden}}
+  .role-card-box{background:#fff;border-radius:16px;padding:26px 30px;width:560px;
+    box-shadow:0 20px 50px rgba(15,23,42,.18);text-align:center;}
+  .role-card-box h2{margin:0 0 4px;font-size:18px;}
+  .role-card-box p{margin:0 0 18px;color:var(--muted);font-size:13px;}
+  .roles{display:grid;grid-template-columns:repeat(4,1fr);gap:12px;}
+  .role{
+    border:1.5px solid var(--line);border-radius:12px;padding:14px 8px;font-size:13.5px;
+    background:#fff;position:relative;
+  }
+  .role .emo{font-size:22px;display:block;margin-bottom:6px;}
+  .role.resident{animation:pickResident .5s 3.3s both;}
+  @keyframes pickResident{from{border-color:var(--line);background:#fff}
+    to{border-color:var(--accent);background:#ecfeff;box-shadow:0 0 0 4px rgba(8,145,178,.12)}}
+  .role .chk{position:absolute;top:6px;right:8px;color:var(--accent);font-weight:700;opacity:0;}
+  .role.resident .chk{animation:chkIn .3s 3.6s both;}
+  @keyframes chkIn{from{opacity:0;transform:scale(.6)}to{opacity:1;transform:none}}
+  /* ---------- 聊天内容 ---------- */
+  .chat-scroll{height:100%;overflow:hidden;padding:18px 22px;display:flex;flex-direction:column;gap:14px;}
+  .empty{align-self:center;margin:auto;color:var(--muted);font-size:13.5px;text-align:center;}
+  .msg{display:flex;gap:10px;max-width:82%;}
+  .msg.user{align-self:flex-end;flex-direction:row-reverse;}
+  .avatar{width:34px;height:34px;border-radius:9px;flex:0 0 auto;display:flex;
+    align-items:center;justify-content:center;font-size:16px;color:#fff;background:var(--primary);}
+  .msg.user .avatar{background:linear-gradient(135deg,var(--user1),var(--user2));}
+  .bubble{padding:11px 14px;border-radius:13px;font-size:14px;line-height:1.65;}
+  .msg.ai .bubble{background:var(--bg);border:1px solid var(--line);border-top-left-radius:4px;}
+  .msg.user .bubble{background:linear-gradient(135deg,var(--user1),var(--user2));color:#fff;border-top-right-radius:4px;}
+  .reveal{opacity:0;animation:popIn .5s both;}
+  @keyframes popIn{from{opacity:0;transform:scale(.97) translateY(8px)}to{opacity:1;transform:none}}
+  .thinking{display:flex;gap:5px;padding:6px 4px;}
+  .thinking i{width:7px;height:7px;border-radius:50%;background:var(--muted);display:block;
+    animation:blink 1s infinite;}
+  .thinking i:nth-child(2){animation-delay:.15s}.thinking i:nth-child(3){animation-delay:.3s}
+  @keyframes blink{0%,60%,100%{opacity:.25}30%{opacity:1}}
+  .think-wrap{animation:popIn .4s 8.4s both, fadeOut .4s 9.6s forwards;}
+  @keyframes fadeOut{to{opacity:0;visibility:hidden}}
+  /* 查询拆分提示 */
+  .decomp{margin:2px 0 0 44px;background:#ecfeff;border:1px solid #a5f3fc;color:#0e7490;
+    border-radius:10px;padding:9px 12px;font-size:12.5px;line-height:1.6;max-width:82%;}
+  .decomp b{display:block;margin-bottom:3px;font-size:12.5px;}
+  .decomp ul{margin:4px 0 0;padding-left:18px;}.decomp li{margin:1px 0;}
+  /* 引用溯源 */
+  .cites{margin:4px 0 0 44px;display:flex;flex-direction:column;gap:7px;max-width:82%;}
+  .cite{background:#f8fafc;border:1px solid var(--line);border-left:3px solid var(--accent);
+    border-radius:9px;padding:8px 11px;font-size:12.5px;}
+  .cite .t{font-weight:600;color:#0f172a;display:flex;justify-content:space-between;gap:10px;}
+  .cite .tag{font-size:11px;color:#fff;background:var(--accent);border-radius:6px;padding:1px 7px;font-weight:500;}
+  .cite .rel{color:var(--muted);font-size:11.5px;}
+  .cite .s{color:#475569;margin-top:3px;line-height:1.55;}
+  /* ---------- 知识库面板 ---------- */
+  .kb-scroll{height:100%;overflow:hidden;padding:18px 22px;}
+  .kb-h{font-size:14px;color:#334155;margin:0 0 12px;font-weight:600;}
+  .kb-item{display:flex;align-items:center;justify-content:space-between;padding:12px 14px;
+    border:1px solid var(--line);border-radius:11px;margin-bottom:10px;background:#fff;font-size:13.5px;}
+  .kb-item .meta{color:var(--muted);font-size:12px;}
+  .badge{font-size:11.5px;padding:3px 10px;border-radius:20px;font-weight:600;}
+  .b-pub{background:#dcfce7;color:#15803d;}.b-draft{background:#fef3c7;color:#b45309;}
+  .b-off{background:#e2e8f0;color:#475569;}
+  /* ---------- 模型下拉（28s 时间线）---------- */
+  .model-wrap{position:relative;}
+  .model-menu{
+    position:absolute;right:0;top:42px;background:#fff;border:1px solid var(--line);
+    border-radius:11px;box-shadow:0 14px 34px rgba(15,23,42,.16);width:180px;padding:6px;z-index:8;
+    animation:dropOpen 28s both;
+  }
+  @keyframes dropOpen{0%,84%{opacity:0;transform:translateY(-8px);visibility:hidden}
+    87%,100%{opacity:1;transform:none;visibility:visible}}
+  .mi{display:flex;align-items:center;justify-content:space-between;padding:9px 11px;border-radius:8px;font-size:13px;}
+  .mi.on{background:#ecfeff;color:var(--primary);font-weight:600;}
+  .mi .dot{width:7px;height:7px;border-radius:50%;background:var(--accent);}
+  .caret{display:inline-block;width:7px;color:var(--accent);font-weight:700;
+    animation:blink .8s infinite, caretHide .3s 15.8s forwards;}
+  @keyframes caretHide{to{opacity:0}}
+</style>
+</head>
+<body>
+  <div class="window">
+    <div class="titlebar">
+      <div class="dots"><i></i><i></i><i></i></div>
+      <div class="urlbar"><b>🔒</b> http://localhost:5173 &nbsp;·&nbsp; 社区矛盾调解 RAG 助手</div>
+    </div>
+
+    <div class="app">
+      <div class="app-header">
+        <div class="brand">
+          <h1>社区矛盾调解 RAG 助手</h1>
+          <span>检索增强 · 可溯源 · 不编造</span>
+        </div>
+        <div class="header-bar">
+          <div class="tabs">
+            <div class="tab chat">对话</div>
+            <div class="tab kb">知识库</div>
+          </div>
+          <div class="controls">
+            <div class="ctl">📋 本会话提问 <span class="ar">▾</span></div>
+            <div class="ctl model-wrap">🤖 模型：DeepSeek <span class="ar">▾</span>
+              <div class="model-menu">
+                <div class="mi on">DeepSeek V3 <span class="dot"></span></div>
+                <div class="mi">智谱 GLM-4</div>
+                <div class="mi">通义千问 Max</div>
+              </div>
+            </div>
+          </div>
+        </div>
+      </div>
+
+      <div class="views">
+        <!-- 对话面板 -->
+        <div class="chat-panel">
+          <div class="chat-scroll">
+            <div class="empty reveal" style="animation-delay:1.2s">👋 选择一个身份后，描述你的纠纷，几秒拿到可溯源的处置建议</div>
+
+            <div class="msg user reveal" style="animation-delay:7s">
+              <div class="avatar">🧑</div>
+              <div class="bubble">楼上漏水把我家的天花板泡坏了，邻居不认，我该怎么维权？</div>
+            </div>
+
+            <div class="think-wrap"><div class="msg ai"><div class="avatar">⚖️</div>
+              <div class="bubble"><div class="thinking"><i></i><i></i><i></i></div></div></div></div>
+
+            <div class="msg ai reveal" style="animation-delay:9.6s">
+              <div class="avatar">⚖️</div>
+              <div class="bubble">
+                <div class="reveal" style="animation-delay:10.4s">您好，遇到楼上漏水泡坏天花板，建议按下面三步处理：</div>
+                <div class="reveal" style="animation-delay:11.8s;margin-top:6px">1. 固定证据：立刻拍照/录像记录漏水点与受损情况，保留物业报修记录。</div>
+                <div class="reveal" style="animation-delay:13.0s;margin-top:6px">2. 明确责任：根据《民法典》第 296 条，楼上住户对自有管道负有管理义务，造成相邻损害应赔偿。</div>
+                <div class="reveal" style="animation-delay:14.2s;margin-top:6px">3. 协商与维权：先请物业协调；不成可向社区人民调解委员会申请调解；仍无法达成一致可向法院起诉，主张修复＋赔偿。</div>
+                <div class="reveal" style="animation-delay:15.2s;margin-top:6px">注意：先别自行拆改，以免破坏现场证据。<span class="caret">▋</span></div>
+              </div>
+            </div>
+
+            <div class="decomp reveal" style="animation-delay:9.2s">
+              <b>🧩 查询已自动拆分为 3 个子问题分别检索后合并</b>
+              <ul>
+                <li>楼上漏水造成损失，责任如何认定？</li>
+                <li>邻居不承认，我需要怎么举证？</li>
+                <li>我可以主张哪些赔偿、走什么程序？</li>
+              </ul>
+            </div>
+
+            <div class="cites">
+              <div class="cite reveal" style="animation-delay:16.2s">
+                <div class="t"><span>《民法典》相邻关系·第 296 条</span><span class="tag">法条</span></div>
+                <div class="rel">相关度 0.91</div>
+                <div class="s">不动产权利人因用水、排水、通行等利用相邻不动产的，应当尽量避免对相邻方造成损害……</div>
+              </div>
+              <div class="cite reveal" style="animation-delay:16.8s">
+                <div class="t"><span>社区漏水纠纷调解指引（街道版）</span><span class="tag">调解指引</span></div>
+                <div class="rel">相关度 0.86</div>
+                <div class="s">物业应协助查明漏点并组织双方调解，必要时联系专业机构鉴定。</div>
+              </div>
+              <div class="cite reveal" style="animation-delay:17.4s">
+                <div class="t"><span>财产损失赔偿举证清单</span><span class="tag">实务文档</span></div>
+                <div class="rel">相关度 0.82</div>
+                <div class="s">建议保留照片、视频、报修单、维修报价单作为索赔依据。</div>
+              </div>
+            </div>
+          </div>
+        </div>
+
+        <!-- 知识库面板 -->
+        <div class="kb-panel">
+          <div class="kb-scroll">
+            <div class="kb-h">知识库（先审后上：草稿 → 发布 / 下架 / 删除）</div>
+            <div class="kb-item reveal" style="animation-delay:20.0s"><div><div>社区矛盾调解手册（2024 版）</div><div class="meta">48 篇 · 已入库</div></div><span class="badge b-pub">已发布</span></div>
+            <div class="kb-item reveal" style="animation-delay:20.5s"><div><div>民法典相邻关系法条汇编</div><div class="meta">法条 · 已入库</div></div><span class="badge b-pub">已发布</span></div>
+            <div class="kb-item reveal" style="animation-delay:21.0s"><div><div>物业维修责任划分指引</div><div class="meta">指引 · 已入库</div></div><span class="badge b-pub">已发布</span></div>
+            <div class="kb-item reveal" style="animation-delay:21.5s"><div><div>噪音扰民处置流程</div><div class="meta">草稿待审</div></div><span class="badge b-draft">草稿</span></div>
+            <div class="kb-item reveal" style="animation-delay:22.0s"><div><div>宠物纠纷典型案例</div><div class="meta">已下架</div></div><span class="badge b-off">已下架</span></div>
+          </div>
+        </div>
+
+        <!-- 角色选择弹层 -->
+        <div class="role-modal">
+          <div class="role-card-box">
+            <h2>请选择你的身份</h2>
+            <p>不同身份会切换答案视角，把“调解员要做的事”转成你可以执行的动作</p>
+            <div class="roles">
+              <div class="role resident"><span class="chk">✓</span><span class="emo">🧑</span>居民</div>
+              <div class="role"><span class="emo">🏢</span>物业</div>
+              <div class="role"><span class="emo">⚖️</span>调解员</div>
+              <div class="role"><span class="emo">📋</span>网格员</div>
+            </div>
+          </div>
+        </div>
+      </div>
+    </div>
+  </div>
+</body>
+</html>

@@ -19,6 +19,14 @@
 
 ---
 
+## 产品演示
+
+30 秒看完整流程：选身份 → 提问 → **自动拆复杂问题** → **流式答 + 引用溯源** → 知识库后台 → 切模型。
+
+<video src="./assets/demo.mp4" controls width="100%"></video>
+
+---
+
 ## 马上跑起来（3 步）
 
 ```bash
@@ -136,6 +144,7 @@ PYTHONPATH=. python tests/run_ragas.py --provider all   # RAGAS 四指标横评
 
 ```
 .
+├── assets/                  # README 演示视频 demo.mp4 及可再生的源文件
 ├── backend/
 │   ├── app/
 │   │   ├── config.py         # 全部配置（模型/向量库/网关/检索，走环境变量）
