@@ -26,7 +26,7 @@
 <p align="center">
   <a href="./assets/demo.mp4"><img src="./assets/demo-poster.png" alt="点击查看 30 秒产品演示" width="900"></a>
 </p>
-<p align="center"><sub>👆 点击封面在新标签页播放（GitHub README 对 video 标签的渲染不稳定，封面图方案更稳）</sub></p>
+<p align="center"><sub>👆 点击封面在新标签页播放</sub></p>
 
 ---
 
@@ -42,7 +42,7 @@ cd frontend && npm install && npm run dev
 # 访问 http://localhost:5173
 ```
 
-填 Key（DeepSeek / 智谱 / 通义任一，见 `.env.example`）即切换真实模型，无需改代码。
+填 Key（DeepSeek / 智谱 / 通义任一，见 `.env.example`）即切换真实模型。
 
 ---
 
@@ -61,7 +61,7 @@ cd frontend && npm install && npm run dev
 
 ## 工程化（网关层，生产可用）
 
-全部零额外依赖、可在 `backend/app/config.py` 一键开关：
+全部可在 `backend/app/config.py` 一键开关：
 
 - **多用户会话隔离**：按 `user_id` 命名空间隔离，跨用户不可见。
 - **三维限流**：用户 / IP / 全局令牌桶，超限 `429 + Retry-After`；Redis 可用则持久化，否则内存兜底。
@@ -105,7 +105,7 @@ cd frontend && npm install && npm run dev
 - **后端**：Python 标准库 + `http.server`；生产可切 FastAPI
 - **前端**：Vue 3
 - **检索**：混合检索+ RRF 融合 + 重排；向量库Qdrant
-- **模型**：智谱 Embedding-3；DeepSeek / 智谱 GLM / 通义千问（OpenAI 兼容统一接口）
+- **模型**：智谱 Embedding-3；DeepSeek / 智谱 GLM / 通义千问
 - **评测**：RAGAS 四指标
 
 ---
@@ -126,7 +126,7 @@ PYTHONPATH=. python tests/run_ragas.py --provider all   # RAGAS 四指标横评
 
 ## 优化路线图（已知短板 → 计划）
 
-- **提升回答忠实度**：扩充语料 + 提示词收紧 + 引入自校验。
+- **提升ragas指标**：扩充语料 + 提示词收紧 + 引入自校验。
 - **重排升级**：接入 `bge-reranker-v2-m3` 跨编码器精排（`rerank.py` 已预留 `mode="bge"`）。
 - **检索增强**：查询改写（同义扩展）、时间 / 地域感知过滤。
 - **网关补强**：正式认证（JWT）、Langfuse追踪接入。
